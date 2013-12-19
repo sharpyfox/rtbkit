@@ -362,6 +362,9 @@ private:
     /** Handle a new auction that came in. */
     void doAuction(const SubmittedAuctionEvent & event);
 
+    /** Log a new auction that came in. */
+    virtual void logAuction(const SubmittedAuctionEvent & event);
+
     /** Handle a post-auction event that came in. */
     void doEvent(const std::shared_ptr<PostAuctionEvent> & event);
 

@@ -774,6 +774,12 @@ checkExpiredAuctions()
 
 void
 PostAuctionLoop::
+logAuction(const SubmittedAuctionEvent & event) {
+    //dummy
+}
+
+void
+PostAuctionLoop::
 doAuction(const SubmittedAuctionEvent & event)
 {
     try {
@@ -801,6 +807,8 @@ doAuction(const SubmittedAuctionEvent & event)
         submission.bidRequestStr = std::move(event.bidRequestStr);
         submission.augmentations = std::move(event.augmentations);
         submission.bid = std::move(event.bidResponse);
+
+        logAuction(event);
 
         submitted.insert(key, submission, lossTimeout);
 
