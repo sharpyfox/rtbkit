@@ -224,7 +224,7 @@ shutdown()
 
 void
 PostAuctionService::
-logAuction(const SubmittedAuctionEvent & event) {
+logAuction(std::shared_ptr<SubmittedAuctionEvent> event) {
     //dummy
 }
 
@@ -401,6 +401,7 @@ doAuction(std::shared_ptr<SubmittedAuctionEvent> event)
 {
     stats.auctions++;
     matcher->doAuction(std::move(event));
+    logAuction(event);
 }
 
 void

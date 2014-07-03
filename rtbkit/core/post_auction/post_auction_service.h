@@ -53,7 +53,7 @@ struct PostAuctionService : public ServiceBase, public MonitorProvider
     }
 
     /** Log a new auction that came in. */
-    virtual void logAuction(const SubmittedAuctionEvent & event);
+    virtual void logAuction(std::shared_ptr<SubmittedAuctionEvent> event);
 
     /************************************************************************/
     /* BANKER                                                               */
