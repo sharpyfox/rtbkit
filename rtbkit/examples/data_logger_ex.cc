@@ -11,8 +11,6 @@
 #include "soa/logger/file_output.h"
 #include "soa/logger/multi_output.h"
 #include "soa/service/service_utils.h"
-#include "rtbkit/common/bid_request.h"
-#include "orbitscripts/common/stat_data_helper.h"
 
 #include <boost/program_options/cmdline.hpp>
 #include <boost/program_options/options_description.hpp>
@@ -29,34 +27,6 @@
 using namespace std;
 using namespace Datacratic;
 using namespace RTBKIT;
-
-struct OrbitRotatingFileOutput : public RotatingFileOutput {
-
-    OrbitRotatingFileOutput():RotatingFileOutput() {};
-    
-    virtual void logMessage(const std::string & channel,
-                            const std::string & message) {
-
-        std::vector<std::string> strs;
-        boost::split(strs, message, boost::is_any_of("\t"));
-        std::string strRequest = strs[2];
-        std::shared_ptr<RTBKIT::BidRequest> br(
-                RTBKIT::BidRequest::parse("datacratic", strRequest));
-        
-        OrbitScripts::StatDataHelper helper;
-        helper.init(br);
-        std::string out;
-        out +=  helper.getExchange() + "\t" +
-                br->userIds.exchangeId.toString() + "\t" +
-                br->userIds.providerId.toString() + "\t" +
-                helper.getCategories() + "\t" +
-                helper.getPublisherDomain() + "\t" +
-                helper.getWebSitePageUrl();
-                
-        RotatingFileOutput::logMessage(channel, out);
-    }
-
-};
 
 
 /******************************************************************************/
@@ -91,26 +61,24 @@ setupOutputs(
 
     auto createMatchedWinFile = [=] (const string & pattern)
         {
-            auto result = make_shared<OrbitRotatingFileOutput>();
+            auto result = make_shared<RotatingFileOutput>();
             result->open(pattern, rotationInterval);
             return result;
         };
 
     // The magic constants represent indexes in the received message.
-    /*
     strategyOutput->logTo(
             "MATCHEDWIN",
             logDir + "/%F/$(17)/$(5)/$(0)-%T.log.gz",
             createMatchedWinFile);
-    */
     strategyOutput->logTo(
-            "AUCTION",
-            logDir + "/%F/$(0)-%T.log.gz",
+            "",
+            logDir + "/%F/$(10)/$(11)/$(0)-%T.log.gz",
             createMatchedWinFile);
 
     logger.addOutput(
             strategyOutput,
-            boost::regex("AUCTION|MATCHEDWIN|MATCHEDIMPRESSION|MATCHEDCLICK"));
+            boost::regex("MATCHEDWIN|MATCHEDIMPRESSION|MATCHEDCLICK"));
 }
 
 
