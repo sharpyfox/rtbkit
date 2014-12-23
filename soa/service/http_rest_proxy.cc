@@ -45,7 +45,8 @@ perform(const std::string & verb,
         const RestParams & headers,
         double timeout,
         bool exceptions,
-        OnData onData) const
+        OnData onData,
+        OnHeader onHeader) const
 {
     string responseHeaders;
     string body;
@@ -104,6 +105,7 @@ perform(const std::string & verb,
                 if (onData) {
                     if (!onData(string(data, data + ofs1 * ofs2)))
                         return 0;
+                    return ofs1 * ofs2;
                 }
 
                 body.append(data, ofs1 * ofs2);
@@ -123,8 +125,13 @@ perform(const std::string & verb,
 
         //cerr << endl << endl << "*******************" << endl;
 
-        auto onHeader = [&] (char * data, size_t ofs1, size_t ofs2) -> size_t
+        Response response;
+        bool headerParsed = false;
+
+        auto onHeaderLine = [&] (char * data, size_t ofs1, size_t ofs2) -> size_t
             {
+                ExcAssert(!headerParsed);
+
                 string headerLine(data, ofs1 * ofs2);
 
                 if (debug)
@@ -139,12 +146,20 @@ perform(const std::string & verb,
                 }
                 else {
                     responseHeaders.append(headerLine);
+                    if (headerLine == "\r\n") {
+                        response.header_.parse(responseHeaders);
+                        headerParsed = true;
+
+                        if (onHeader)
+                            if (!onHeader(response.header_))
+                                return 0;  // bail
+                    }
                     //cerr << "got header data " << headerLine << endl;
                 }
                 return ofs1 * ofs2;
             };
 
-        myRequest.setOpt<BoostHeaderFunction>(onHeader);
+        myRequest.setOpt<BoostHeaderFunction>(onHeaderLine);
         myRequest.setOpt<BoostWriteFunction>(onWriteData);
         myRequest.setOpt<BoostProgressFunction>(onProgress);
         for (auto & cookie: cookies)
@@ -170,19 +185,17 @@ perform(const std::string & verb,
 
         if (exceptions) {
             myRequest.perform();
+            response.body_ = body;
         }
         else {
             CURLcode code = curl_easy_perform(myRequest.getHandle());
+            response.body_ = body;
             if (code != CURLE_OK) {
-                Response response;
                 response.errorCode_ = code;
                 response.errorMessage_ = curl_easy_strerror(code);
                 return response;
             }
         }
-
-        Response response;
-        response.body_ = body;
 
         curlpp::InfoGetter::get(myRequest, CURLINFO_RESPONSE_CODE,
                                 response.code_);
@@ -194,7 +207,7 @@ perform(const std::string & verb,
 
         //cerr << "uploaded " << bytesUploaded << " bytes" << endl;
 
-        response.header_.parse(responseHeaders);
+        ExcAssert(headerParsed);
 
         return response;
     } catch (const curlpp::LibcurlRuntimeError & exc) {
@@ -252,7 +265,7 @@ doneConnection(curlpp::Easy * conn)
 
 JsonRestProxy::
 JsonRestProxy(const string & url)
-    : HttpRestProxy(url), maxRetries(10)
+    : HttpRestProxy(url), maxRetries(10), maxBackoffTime(900)
 {
     if (url.find("https://") == 0) {
         cerr << "warning: no validation will be performed on the SSL cert.\n";
@@ -262,11 +275,11 @@ JsonRestProxy(const string & url)
 
 HttpRestProxy::Response
 JsonRestProxy::
-putOrPost(const string & resource, const string & body, bool isPost)
+performWithBackoff(const string & method, const string & resource,
+                   const string & body)
     const
 {
     HttpRestProxy::Response response;
-    const char * verb = isPost ? "POST" : "PUT";
 
     JML_TRACE_EXCEPTIONS(false);
 
@@ -278,10 +291,10 @@ putOrPost(const string & resource, const string & body, bool isPost)
         headers.emplace_back(make_pair("Cookie", "token=\"" + authToken + "\""));
     }
 
-    string method = isPost ? "post" : "put";
     pid_t tid = gettid();
-    size_t retries;
-    for (retries = 0; retries < maxRetries; retries++) {
+    for (int retries = 0;
+         (maxRetries == -1) || (retries < maxRetries);
+         retries++) {
         response = this->perform(method, resource, content, RestParams(),
                                  headers);
         int code = response.code();
@@ -294,23 +307,22 @@ putOrPost(const string & resource, const string & body, bool isPost)
             string respBody = response.body();
             ::fprintf(stderr,
                       "[%d] %s %s returned response code %d"
-                      " (attempt %lu):\n"
+                      " (attempt %d):\n"
                       "request body (%lu) = '%s'\n"
                       "response body (%lu): '%s'\n",
-                      tid, verb, resource.c_str(), code, retries,
+                      tid, method.c_str(), resource.c_str(), code, retries,
                       body.size(), body.c_str(),
                       respBody.size(), respBody.c_str());
         }
         if (code < 500) {
-            throw ML::Exception("[%d] error is unrecoverable");
+            break;
         }
 
         /* recoverable errors */
-        if (retries < maxRetries) {
-            sleepAfterRetry(retries);
-            ::fprintf(stderr, "[%d] retrying %s %s after error"
-                      " (%lu/%lu)\n",
-                      tid, verb, resource.c_str(), retries + 1, maxRetries);
+        if (maxRetries == -1 || retries < maxRetries) {
+            sleepAfterRetry(retries, maxBackoffTime);
+            ::fprintf(stderr, "[%d] retrying %s %s after error (%d/%d)\n",
+                      tid, method.c_str(), resource.c_str(), retries + 1, maxRetries);
         }
         else {
             throw ML::Exception("[%d] too many retries\n", tid);
@@ -318,20 +330,6 @@ putOrPost(const string & resource, const string & body, bool isPost)
     }
 
     return response;
-}
-
-HttpRestProxy::Response
-JsonRestProxy::
-get(const string & resource)
-    const
-{
-    RestParams headers;
-
-    if (authToken.size() > 0) {
-        headers.emplace_back(make_pair("Cookie", "token=\"" + authToken + "\""));
-    }
-
-    return HttpRestProxy::get(resource, RestParams(), headers);
 }
 
 bool
@@ -354,13 +352,17 @@ authenticate(const JsonAuthenticationRequest & creds)
 
 void
 JsonRestProxy::
-sleepAfterRetry(int retryNbr)
+sleepAfterRetry(int retryNbr, int maxBaseTime)
 {
     static const double sleepUnit(0.2);
-    int rnd = random();
 
     int maxSlot = (1 << retryNbr) - 1;
-    double timeToSleep = ((double) rnd / RAND_MAX) * maxSlot * sleepUnit;
+    double baseTime = maxSlot * sleepUnit;
+    if (baseTime > maxBaseTime) {
+        baseTime = maxBaseTime;
+    }
+    int rnd = random();
+    double timeToSleep = ((double) rnd / RAND_MAX) * baseTime;
     // cerr << "sleeping " << timeToSleep << endl;
 
     ML::sleep(timeToSleep);

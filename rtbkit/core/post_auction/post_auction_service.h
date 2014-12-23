@@ -18,6 +18,7 @@
 #include "soa/service/zmq_endpoint.h"
 #include "soa/service/zmq_named_pub_sub.h"
 #include "soa/service/zmq_message_router.h"
+#include "rtbkit/common/analytics_publisher.h"
 
 namespace RTBKIT {
 
@@ -29,6 +30,12 @@ struct BidderInterface;
 
 struct PostAuctionService : public ServiceBase, public MonitorProvider
 {
+
+    enum {
+        DefaultWinLossPipeTimeout = 10,
+        DefaultCampaignEventPipeTimeout = 10
+    };
+
     PostAuctionService(ServiceBase & parent,
                     const std::string & serviceName);
     PostAuctionService(std::shared_ptr<ServiceProxies> proxies,
@@ -39,7 +46,8 @@ struct PostAuctionService : public ServiceBase, public MonitorProvider
 
 
     void initBidderInterface(Json::Value const & json);
-    void init(size_t shards = 1);
+    void init(size_t externalShard = 0, size_t internalShards = 1);
+    void initAnalytics(const std::string & baseUrl, const int numConnections);
     void start(std::function<void ()> onStop = std::function<void ()>());
     void shutdown();
 
@@ -65,6 +73,7 @@ struct PostAuctionService : public ServiceBase, public MonitorProvider
     void setBanker(const std::shared_ptr<Banker> & newBanker)
     {
         matcher->setBanker(banker = newBanker);
+        monitorProviderClient.addProvider(banker.get());
     }
 
 
@@ -90,6 +99,21 @@ struct PostAuctionService : public ServiceBase, public MonitorProvider
         if (matcher) matcher->setAuctionTimeout(timeout);
     }
 
+    void setWinLossPipeTimeout(int timeout)
+    {
+        if (timeout < 0)
+            throw ML::Exception("Invalid timeout for WinLoss Pipe timeout");
+
+        winLossPipeTimeout = timeout;
+    }
+
+    void setCampaignEventPipeTimeout(int timeout)
+    {
+        if (timeout < 0)
+            throw ML::Exception("Invalid timeout for Campaign Event Pipe timeout");
+
+        campaignEventPipeTimeout = timeout;
+    }
 
     /************************************************************************/
     /* LOGGING                                                              */
@@ -202,6 +226,7 @@ struct PostAuctionService : public ServiceBase, public MonitorProvider
         Stats(const Stats& other);
         Stats& operator=(const Stats& other);
         Stats& operator-=(const Stats& other);
+        Stats& operator+=(const Stats& other);
 
     } stats;
 
@@ -220,7 +245,7 @@ private:
     /** Initialize all of our connections, hooking everything in to the
         event loop.
     */
-    void initConnections();
+    void initConnections(size_t shard);
     void initMatcher(size_t shards);
 
     void doAuction(std::shared_ptr< SubmittedAuctionEvent> event);
@@ -250,9 +275,16 @@ private:
     void doUnmatched(std::shared_ptr<UnmatchedEvent> event);
     void doError(std::shared_ptr<PostAuctionErrorEvent> error);
 
+    void deliverEvent(const std::string& label, const std::string& eventType,
+                      const AccountKey& account,
+                      std::function<void(const AgentConfigEntry& entry)> onAgent);
+
 
     float auctionTimeout;
     float winTimeout;
+
+    int winLossPipeTimeout;
+    int campaignEventPipeTimeout;
 
     Date lastWinLoss;
     Date lastCampaignEvent;
@@ -276,6 +308,7 @@ private:
 
     ZmqMessageRouter router;
 
+    AnalyticsPublisher analytics;
 };
 
 } // namespace RTBKIT

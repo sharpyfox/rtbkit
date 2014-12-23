@@ -28,7 +28,7 @@ sendImpression(const BidRequest& bidRequest, const Bid& bid)
     json["timestamp"] = Date::now().secondsSinceEpoch();
     json["bidRequestId"] = bidRequest.auctionId.toString();
     json["impid"] = bid.adSpotId.toString();
-    json["userIds"] = bidRequest.userIds.toJson();
+    json["userIds"] = bidRequest.userIds.toJsonArray();
     json["type"] = "CONVERSION";
     sendEvent(json); 
 }
@@ -42,7 +42,7 @@ sendClick(const BidRequest& bidRequest, const Bid& bid)
     json["timestamp"] = Date::now().secondsSinceEpoch();
     json["bidRequestId"] = bidRequest.auctionId.toString();
     json["impid"] = bid.adSpotId.toString();
-    json["userIds"] = bidRequest.userIds.toJson();
+    json["userIds"] = bidRequest.userIds.toJsonArray();
     json["type"] = "CLICK";
     sendEvent(json); 
 }

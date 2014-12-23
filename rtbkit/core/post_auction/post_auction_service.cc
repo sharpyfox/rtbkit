@@ -34,10 +34,12 @@ PostAuctionService(
 
       auctionTimeout(EventMatcher::DefaultAuctionTimeout),
       winTimeout(EventMatcher::DefaultWinTimeout),
+      winLossPipeTimeout(DefaultWinLossPipeTimeout),
+      campaignEventPipeTimeout(DefaultCampaignEventPipeTimeout),
 
       loopMonitor(*this),
       configListener(getZmqContext()),
-      monitorProviderClient(getZmqContext(), *this),
+      monitorProviderClient(getZmqContext()),
 
       auctions(65536),
       events(65536),
@@ -46,7 +48,9 @@ PostAuctionService(
       endpoint(getZmqContext()),
       bridge(getZmqContext()),
       router(!!getZmqContext())
-{}
+{
+    monitorProviderClient.addProvider(this);
+}
 
 PostAuctionService::
 PostAuctionService(ServiceBase & parent, const std::string & serviceName)
@@ -57,7 +61,7 @@ PostAuctionService(ServiceBase & parent, const std::string & serviceName)
 
       loopMonitor(*this),
       configListener(getZmqContext()),
-      monitorProviderClient(getZmqContext(), *this),
+      monitorProviderClient(getZmqContext()),
 
       auctions(65536),
       events(65536),
@@ -66,7 +70,9 @@ PostAuctionService(ServiceBase & parent, const std::string & serviceName)
       endpoint(getZmqContext()),
       bridge(getZmqContext()),
       router(!!getZmqContext())
-{}
+{
+    monitorProviderClient.addProvider(this);
+}
 
 
 void
@@ -80,8 +86,10 @@ bindTcp()
 
 void
 PostAuctionService::
-init(size_t shards)
+init(size_t externalShard, size_t internalShards)
 {
+    recordHit("up");
+
     // Loop monitor is purely for monitoring purposes. There's no message we can
     // just drop in the PAL to alleviate the load.
     loopMonitor.init();
@@ -93,8 +101,8 @@ init(size_t shards)
         initBidderInterface(json);
     }
 
-    initMatcher(shards);
-    initConnections();
+    initMatcher(internalShards);
+    initConnections(externalShard);
     monitorProviderClient.init(getServices()->config);
 }
 
@@ -146,12 +154,12 @@ initMatcher(size_t shards)
 
 void
 PostAuctionService::
-initConnections()
+initConnections(size_t shard)
 {
     using std::placeholders::_1;
     using std::placeholders::_2;
 
-    registerServiceProvider(serviceName(), { "rtbPostAuctionService" });
+    registerShardedServiceProvider(serviceName(), { "rtbPostAuctionService" }, shard);
 
     LOG(print) << "post auction logger on " << serviceName() + "/logger" << endl;
     logger.init(getServices()->config, serviceName() + "/logger");
@@ -195,7 +203,14 @@ initConnections()
     // Every second we check for expired auctions
     loop.addPeriodic("PostAuctionService::checkExpiredAuctions", 0.1,
             std::bind(&EventMatcher::checkExpiredAuctions, matcher.get()));
+}
 
+void
+PostAuctionService::
+initAnalytics(const string & baseUrl, const int numConnections)
+{
+    LOG(print) << "analyticsURI: " << baseUrl << endl;
+    analytics.init(baseUrl, numConnections);
 }
 
 void
@@ -206,6 +221,8 @@ start(std::function<void ()> onStop)
     monitorProviderClient.start();
     loopMonitor.start();
     matcher->start();
+    bidder->start();
+    analytics.start();
 }
 
 void
@@ -220,6 +237,7 @@ shutdown()
     endpoint.shutdown();
     configListener.shutdown();
     monitorProviderClient.shutdown();
+    analytics.shutdown();
 }
 
 
@@ -245,17 +263,9 @@ PostAuctionService::
 doAuctionMessage(const std::vector<std::string> & message)
 {
     recordHit("messages.AUCTION");
-
-    auto msg = Message<SubmittedAuctionEvent>::fromString(message.at(2));
-    if (msg) {
-        auto event = std::make_shared<SubmittedAuctionEvent>(std::move(msg.payload));
-        doAuction(std::move(event));
-    }
-
-    else {
-        LOG(error)
-            << "error while parsing AUCTION message: " << message.at(2) << endl;
-    }
+    auto event = std::make_shared<SubmittedAuctionEvent>(
+            ML::DB::reconstituteFromString<SubmittedAuctionEvent>(message.at(2)));
+    doAuction(std::move(event));
 }
 
 void
@@ -419,14 +429,20 @@ void
 PostAuctionService::
 doMatchedWinLoss(std::shared_ptr<MatchedWinLoss> event)
 {
-    if (event->type == MatchedWinLoss::Win) {
+    if (event->type == MatchedWinLoss::Win || event->type == MatchedWinLoss::LateWin) {
         lastWinLoss = Date::now();
         stats.matchedWins++;
     }
     else stats.matchedLosses++;
 
     event->publish(logger);
-    bidder->sendWinLossMessage(*event);
+    event->publish(analytics);
+
+    deliverEvent("bidResult." + event->typeString(), "doWinLossEvent", event->response.account,
+        [&](const AgentConfigEntry& entry)
+        {
+            bidder->sendWinLossMessage(entry.config, *event);
+        });
 }
 
 void
@@ -438,27 +454,42 @@ doMatchedCampaignEvent(std::shared_ptr<MatchedCampaignEvent> event)
     lastCampaignEvent = Date::now();
 
     event->publish(logger);
+    event->publish(analytics);
 
     // For the moment, send the message to all of the agents that are
     // bidding on this account
-
-    bool sent = false;
-    auto onMatchingAgent = [&] (const AgentConfigEntry & entry)
+    //
+    deliverEvent("delivery." + event->label, "doCampaignEvent", event->account,
+        [&](const AgentConfigEntry& entry)
         {
-            if (!entry.config) return;
-            bidder->sendCampaignEventMessage(entry.name, *event);
-            sent = true;
-        };
+            bidder->sendCampaignEventMessage(entry.config, entry.name, *event);
+        });
 
-    const AccountKey & account = event->account;
+}
+
+void
+PostAuctionService::
+deliverEvent(const std::string& label, const std::string& eventType,
+             const AccountKey& account,
+             std::function<void(const AgentConfigEntry& entry)> onAgent)
+{
+    bool sent = false;
+    auto onMatchingAgent = [&](const AgentConfigEntry& entry)
+    {
+        if (!entry.config) return;
+        onAgent(entry);
+        sent = true;
+    };
+
     configListener.forEachAccountAgent(account, onMatchingAgent);
-
     if (!sent) {
-        recordHit("delivery.%s.orphaned", event->label);
-        logPAError("doCampaignEvent.noListeners" + event->label,
-                "nothing listening for account " + account.toString());
+        recordHit("%s.orphaned", label);
+        logPAError(ML::format("%s.noListeners%s", eventType, label),
+                   "nothing listening for account " + account.toString());
     }
-    else recordHit("delivery.%s.delivered", event->label);
+    else {
+        recordHit("%s.delivered", label);
+    }
 }
 
 void
@@ -467,6 +498,7 @@ doUnmatched(std::shared_ptr<UnmatchedEvent> event)
 {
     stats.unmatchedEvents++;
     event->publish(logger);
+    event->publish(analytics);
 }
 
 void
@@ -475,6 +507,7 @@ doError(std::shared_ptr<PostAuctionErrorEvent> error)
 {
     stats.errors++;
     error->publish(logger);
+    error->publish(analytics);
 }
 
 
@@ -495,8 +528,9 @@ getProviderIndicators()
     /* PA health check:
        - last campaign event in the last 10 seconds */
     Date now = Date::now();
-    bool winLossOk = now < lastWinLoss.plusSeconds(10);
-    bool campaignEventOk = now < lastCampaignEvent.plusSeconds(10);
+    bool winLossOk = now < lastWinLoss.plusSeconds(winLossPipeTimeout);
+    bool campaignEventOk = now < lastCampaignEvent.plusSeconds(campaignEventPipeTimeout);
+    bool bankerOk = banker->getProviderIndicators().status;
 
     // Kept around for posterity.
     // Earned the "Best Error Message in RTBKIT" award.
@@ -510,10 +544,11 @@ getProviderIndicators()
 
     MonitorIndicator ind;
     ind.serviceName = serviceName();
-    ind.status = winLossOk || campaignEventOk;
+    ind.status = (winLossOk || campaignEventOk) && bankerOk;
     ind.message = string()
         + "WinLoss pipe: " + (winLossOk ? "OK" : "ERROR") + ", "
-        + "CampaignEvent pipe: " + (campaignEventOk ? "OK" : "ERROR");
+        + "CampaignEvent pipe: " + (campaignEventOk ? "OK" : "ERROR") + ", "
+        + "Banker: " + (bankerOk ? "OK" : "ERROR");
 
     return ind;
 }
@@ -527,8 +562,8 @@ getProviderIndicators()
 PostAuctionService::Stats::
 Stats() :
     auctions(0), events(0),
-    matchedWins(0), matchedCampaignEvents(0), unmatchedEvents(0),
-    errors(0)
+    matchedWins(0), matchedLosses(0), matchedCampaignEvents(0),
+    unmatchedEvents(0), errors(0)
 {}
 
 PostAuctionService::Stats::
@@ -575,5 +610,20 @@ operator-=(const Stats& other) -> Stats&
     return *this;
 }
 
+auto
+PostAuctionService::Stats::
+operator+=(const Stats& other) -> Stats&
+{
+    auctions += other.auctions;
+    events += other.events;
+
+    matchedWins += other.matchedWins;
+    matchedLosses += other.matchedLosses;
+    matchedCampaignEvents += other.matchedCampaignEvents;
+    unmatchedEvents += other.unmatchedEvents;
+    errors += other.errors;
+
+    return *this;
+}
 
 } // namepsace RTBKIT

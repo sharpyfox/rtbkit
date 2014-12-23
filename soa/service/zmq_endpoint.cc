@@ -34,14 +34,15 @@ ZmqEventSource::
 ZmqEventSource()
     : socket_(0), socketLock_(nullptr)
 {
-    needsPoll = true;
+    needsPoll = false;
 }
 
 ZmqEventSource::
 ZmqEventSource(zmq::socket_t & socket, SocketLock * socketLock)
     : socket_(&socket), socketLock_(socketLock)
 {
-    needsPoll = true;
+    needsPoll = false;
+    updateEvents();
 }
 
 void
@@ -50,7 +51,8 @@ init(zmq::socket_t & socket, SocketLock * socketLock)
 {
     socket_ = &socket;
     socketLock_ = socketLock;
-    needsPoll = true;
+    needsPoll = false;
+    updateEvents();
 }
 
 int
@@ -69,7 +71,25 @@ bool
 ZmqEventSource::
 poll() const
 {
-    return getEvents(socket()).first;
+    if (currentEvents & ZMQ_POLLIN)
+        return true;
+
+    std::unique_lock<SocketLock> guard;
+
+    if (socketLock_)
+        guard = std::unique_lock<SocketLock>(*socketLock_);
+
+    updateEvents();
+
+    return currentEvents & ZMQ_POLLIN;
+}
+
+void
+ZmqEventSource::
+updateEvents() const
+{
+    size_t events_size = sizeof(currentEvents);
+    socket().getsockopt(ZMQ_EVENTS, &currentEvents, &events_size);
 }
 
 bool
@@ -80,26 +100,35 @@ processOne()
     if (debug_)
         cerr << "called processOne on " << this << ", poll = " << poll() << endl;
 
+    if (!poll())
+        return false;
+
     std::vector<std::string> msg;
 
-    /** NOTE: poll() will only work after we've tried (and failed) to
-        pull a message off.
-    */
-    {
-        std::unique_lock<SocketLock> guard;
-        if (socketLock_)
-            guard = std::unique_lock<SocketLock>(*socketLock_);
+    // We process all events, as otherwise the select fd can't be guaranteed to wake us up
+    for (;;) {
+        {
+            std::unique_lock<SocketLock> guard;
+            if (socketLock_)
+                guard = std::unique_lock<SocketLock>(*socketLock_);
 
-        msg = recvAllNonBlocking(socket());
-    }
+            msg = recvAllNonBlocking(socket());
 
-    if (!msg.empty()) {
+            if (msg.empty()) {
+                if (currentEvents & ZMQ_POLLIN)
+                    throw ML::Exception("empty message with currentEvents");
+                return false;  // no more events
+            }
+
+            updateEvents();
+        }
+
         if (debug_)
             cerr << "got message of length " << msg.size() << endl;
         handleMessage(msg);
     }
 
-    return poll();
+    return currentEvents & ZMQ_POLLIN;
 }
 
 void
@@ -389,14 +418,16 @@ bindTcp(PortRange const & portRange, std::string host)
 ZmqNamedProxy::
 ZmqNamedProxy() :
     context_(new zmq::context_t(1)),
-    local(true)
+    local(true),
+    shardIndex(-1)
 {
 }
 
 ZmqNamedProxy::
-ZmqNamedProxy(std::shared_ptr<zmq::context_t> context) :
+ZmqNamedProxy(std::shared_ptr<zmq::context_t> context, int shardIndex) :
     context_(context),
-    local(true)
+    local(true),
+    shardIndex(shardIndex)
 {
 }
 
@@ -558,9 +589,13 @@ connectToServiceClass(const std::string & serviceClass,
             continue;
         }
 
-        if (connect(path + "/" + endpointName,
-                    style == CS_ASYNCHRONOUS ? CS_ASYNCHRONOUS : CS_SYNCHRONOUS))
-            return true;
+        bool ok = connect(
+                path + "/" + endpointName,
+                style == CS_ASYNCHRONOUS ? CS_ASYNCHRONOUS : CS_SYNCHRONOUS);
+        if (!ok) continue;
+
+        shardIndex = value.get("shardIndex", -1).asInt();
+        return true;
     }
 
     if (style == CS_MUST_SUCCEED && connectionState != CONNECTED) {
@@ -687,6 +722,7 @@ onServiceProvidersChanged(const std::string & path, bool local)
         Json::Value value = config->getJson(path + "/" + c);
         std::string name = value["serviceName"].asString();
         std::string path = value["servicePath"].asString();
+        int shardIndex = value.get("shardIndex", -1).asInt();
 
         std::string location = value["serviceLocation"].asString();
         if (local && location != config->currentLocation) {
@@ -697,7 +733,7 @@ onServiceProvidersChanged(const std::string & path, bool local)
             continue;
         }
 
-        watchServiceProvider(name, path);
+        watchServiceProvider(name, path, shardIndex);
     }
 
     // deleting the connection could trigger a callback which is a bad idea
@@ -796,7 +832,7 @@ private:
 
 void
 ZmqMultipleNamedClientBusProxy::
-watchServiceProvider(const std::string & name, const std::string & path)
+watchServiceProvider(const std::string & name, const std::string & path, int shardIndex)
 {
     // Protects the connections map... I think.
     std::unique_lock<Lock> guard(connectionsLock);
@@ -815,7 +851,7 @@ watchServiceProvider(const std::string & name, const std::string & path)
         << "connecting to " << path << " / " << name << std::endl;
 
     try {
-        auto newClient = std::make_shared<ZmqNamedClientBusProxy>(zmqContext);
+        auto newClient = std::make_shared<ZmqNamedClientBusProxy>(zmqContext, shardIndex);
         newClient->init(config, identity);
 
         // The connect call below could trigger this callback while we're

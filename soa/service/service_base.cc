@@ -105,15 +105,17 @@ CarbonEventService(std::shared_ptr<CarbonConnector> conn) :
 
 CarbonEventService::
 CarbonEventService(const std::string & carbonAddress,
-                   const std::string & prefix)
-    : connector(new CarbonConnector(carbonAddress, prefix))
+                   const std::string & prefix,
+                   double dumpInterval)
+    : connector(new CarbonConnector(carbonAddress, prefix, dumpInterval))
 {
 }
 
 CarbonEventService::
 CarbonEventService(const std::vector<std::string> & carbonAddresses,
-                   const std::string & prefix)
-    : connector(new CarbonConnector(carbonAddresses, prefix))
+                   const std::string & prefix,
+                   double dumpInterval)
+    : connector(new CarbonConnector(carbonAddresses, prefix, dumpInterval))
 {
 }
 
@@ -427,6 +429,44 @@ std::string bootstrapConfigPath()
     return "";
 }
 
+static void
+checkSysLimits()
+{
+    enum { MinFds = 1 << 16 };
+
+    rlimit fdLimit;
+    int ret = getrlimit(RLIMIT_NOFILE, &fdLimit);
+
+    if (ret < 0) {
+        std::cerr << "Unable to read ulimits: " << strerror(errno) << std::endl
+            << "Skipping checks on system limits." << std::endl;
+        return;
+    }
+
+    if (fdLimit.rlim_cur >= MinFds) {
+        std::cerr << "FD limit at: " << fdLimit.rlim_cur << std::endl;
+        return;
+    }
+
+    std::cerr << "FD limit too low: "
+        << fdLimit.rlim_cur << "/" << fdLimit.rlim_max
+        << " smaller then recomended " << MinFds
+        << std::endl;
+
+    fdLimit.rlim_cur = std::min<rlim_t>(MinFds, fdLimit.rlim_max);
+
+    ret = setrlimit(RLIMIT_NOFILE, &fdLimit);
+    if (ret < 0) {
+        std::cerr << "Unable to raise FD limit to "
+            << fdLimit.rlim_cur << ": " << strerror(errno)
+            << std::endl;
+        return;
+    }
+
+    std::cerr << "FD limit raised to: " << fdLimit.rlim_cur << std::endl;
+}
+
+
 } // namespace anonymous
 
 ServiceProxies::
@@ -436,23 +476,26 @@ ServiceProxies()
       ports(new DefaultPortRangeService()),
       zmqContext(new zmq::context_t(1 /* num worker threads */))
 {
+    checkSysLimits();
     bootstrap(bootstrapConfigPath());
 }
 
 void
 ServiceProxies::
 logToCarbon(const std::string & carbonConnection,
-            const std::string & prefix)
+            const std::string & prefix,
+            double dumpInterval)
 {
-    events.reset(new CarbonEventService(carbonConnection, prefix));
+    events.reset(new CarbonEventService(carbonConnection, prefix, dumpInterval));
 }
 
 void
 ServiceProxies::
 logToCarbon(const std::vector<std::string> & carbonConnections,
-            const std::string & prefix)
+            const std::string & prefix,
+            double dumpInterval)
 {
-    events.reset(new CarbonEventService(carbonConnections, prefix));
+    events.reset(new CarbonEventService(carbonConnections, prefix, dumpInterval));
 }
 
 void
@@ -575,7 +618,7 @@ bootstrap(const std::string& path)
         file += line + "\n";
     }
 
-    bootstrap(Json::parse(file));
+    bootstrap(params = Json::parse(file));
 }
 
 void
@@ -588,6 +631,12 @@ bootstrap(const Json::Value& config)
     string location = config["location"].asString();
     ExcCheck(!location.empty(), "location is not specified in the bootstrap.json");
 
+    bankerUri = config.get("banker-uri", "").asString();
+    if (bankerUri.empty()) {
+        // Reading bankerHost for historical reason
+        bankerUri = config.get("bankerHost", "").asString();
+    }
+
     if (config.isMember("carbon-uri")) {
         const Json::Value& entry = config["carbon-uri"];
         vector<string> uris;
@@ -598,7 +647,9 @@ bootstrap(const Json::Value& config)
         }
         else uris.push_back(entry.asString());
 
-        logToCarbon(uris, install);
+        double dumpInterval = config.get("carbon-dump-interval", 1.0).asDouble();
+
+        logToCarbon(uris, install, dumpInterval);
     }
 
     if (config.isMember("zookeeper-uri"))
@@ -704,6 +755,22 @@ registerServiceProvider(const std::string & name,
         json["serviceName"] = name;
         json["serviceLocation"] = services_->config->currentLocation;
         json["servicePath"] = name;
+        services_->config->setUnique("serviceClass/" + cl + "/" + name, json);
+    }
+}
+
+void
+ServiceBase::
+registerShardedServiceProvider(const std::string & name,
+                               const std::vector<std::string> & serviceClasses,
+                               size_t shardIndex)
+{
+    for (auto cl: serviceClasses) {
+        Json::Value json;
+        json["serviceName"] = name;
+        json["serviceLocation"] = services_->config->currentLocation;
+        json["servicePath"] = name;
+        json["shardIndex"] = shardIndex;
         services_->config->setUnique("serviceClass/" + cl + "/" + name, json);
     }
 }

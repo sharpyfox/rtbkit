@@ -25,10 +25,34 @@ namespace {
 /* OPENRTB BID REQUEST PARSER                                                */
 /*****************************************************************************/
 
+void parseSDKs(const AdSpot & spot, BidRequest & result){
+    std::vector<std::string> sdks;
+    for ( OpenRTB::ApiFramework sdk : spot.banner->api){
+        switch (sdk.value()) {
+            case OpenRTB::ApiFramework::MRAID:
+                sdks.push_back("MRAID");
+                break;
+            case OpenRTB::ApiFramework::ORMMA:
+                sdks.push_back("ORMMA");
+                break;
+            case OpenRTB::ApiFramework::VPAID_1:
+                sdks.push_back("VPAID 1.0");
+                break;
+            case OpenRTB::ApiFramework::VPAID_2:
+                sdks.push_back("VPAID 2.0");
+                break;
+            default:
+                break;
+        }
+    }
+    if (!sdks.empty()) result.segments.addStrings("supportedSDKs", sdks);
+}
+
 BidRequest *
 fromOpenRtb(OpenRTB::BidRequest && req,
             const std::string & provider,
-            const std::string & exchange)
+            const std::string & exchange,
+            const std::string & version)
 {
     std::unique_ptr<BidRequest> result(new BidRequest());
 
@@ -53,6 +77,7 @@ fromOpenRtb(OpenRTB::BidRequest && req,
                     spot.formats.push_back(Format(spot.banner->w[i],
                                                  spot.banner->h[i]));
                 }
+		parseSDKs(spot, *result.get());
                 spot.position = spot.banner->pos;
             
             } else if (spot.video) {
@@ -65,37 +90,39 @@ fromOpenRtb(OpenRTB::BidRequest && req,
                     THROW(openrtbBidRequestError) << "Video::mimes needs to be populated." << endl;
                 }
             
-                /** 
-                 * Refers to table 6.6 of OpenRTB 2.1
-                 * Linearity is initialized to -1 if we don't get it in the bid request
-                 * so if it's under 0, it means it wasn't given and it can only be 1 or 2
-                 */
-                if(v.linearity.value() < 0 || v.linearity.value() > 2) {
-                    THROW(openrtbBidRequestError) <<"Video::linearity must be specified and match a value in OpenRTB 2.1 Table 6.6." << endl;
-                }
+                if(version == "2.1") {
+                    /** 
+                    * Refers to table 6.6 of OpenRTB 2.1
+                    * Linearity is initialized to -1 if we don't get it in the bid request
+                    * so if it's under 0, it means it wasn't given and it can only be 1 or 2
+                    */
+                    if(v.linearity.value() < -0 ||v.linearity.value() > 2) {
+                        THROW(openrtbBidRequestError) <<"Video::linearity must be specified and match a value in OpenRTB 2.1 Table 6.6." << endl;
+                    }
                 
-                if(v.minduration.value() < 0) {
+                    /** 
+                    * Refers to table 6.7 of OpenRTB 2.1
+                    * Linearity is initialized to -1 if we don't get it in the bid request
+                    * so if it's under -1, it means it wasn't given and it can only be 1 to 6
+                    */
+                
+                    if(v.protocol.value() < 0 || v.protocol.value() > 6) {
+                        THROW(openrtbBidRequestError) << "Video::protocol must be specified and match a value in OpenRTB 2.1 Table 6.7." << endl;
+                    }
+                }
+
+                if(v.minduration.val < 0) {
                     THROW(openrtbBidRequestError) << "Video::minduration must be specified and positive." << endl;
                 }
 
-                if(v.maxduration.value() < 0) {
+                if(v.maxduration.val < 0) {
                     THROW(openrtbBidRequestError) << "Video::maxduration must be specified and positive." << endl;
                 }
-                else if(v.maxduration.value() < v.minduration.value()) {
+                else if(v.maxduration.val < v.minduration.val) {
                     // Illogical
                     THROW(openrtbBidRequestError) << "Video::maxduration can't be smaller than Video::minduration." << endl;
                 }
 
-                /** 
-                 * Refers to table 6.7 of OpenRTB 2.1
-                 * Linearity is initialized to -1 if we don't get it in the bid request
-                 * so if it's under 0, it means it wasn't given and it can only be 1 to 6
-                 */
-                
-                if(v.protocol.value() < 0 || v.protocol.value() > 6) {
-                    THROW(openrtbBidRequestError) << "Video::protocol must be specified and match a value in OpenRTB 2.1 Table 6.7." << endl;
-                }
-                
                 spot.position = spot.video->pos;
 
                 Format format(v.w.value(), v.h.value());
@@ -176,6 +203,11 @@ fromOpenRtb(OpenRTB::BidRequest && req,
             result->url = result->site->page;
         else if (result->site->id)
             result->url = Url("http://" + result->site->id.toString() + ".siteid/");
+
+        // Adding IAB categories to segments
+        for(auto& v : result->site->cat) {
+            result->segments.add("iab-categories", v.val);
+        }
     }
     else if (req.app) {
         result->app.reset(req.app.release());
@@ -184,6 +216,11 @@ fromOpenRtb(OpenRTB::BidRequest && req,
             result->url = Url(result->app->bundle);
         else if (result->app->id)
             result->url = Url("http://" + result->app->id.toString() + ".appid/");
+        
+        // Adding IAB categories to segments
+        for(auto& v : result->app->cat) {
+            result->segments.add("iab-categories", v.val);
+        }
     }
 
     if (req.device) {
@@ -387,9 +424,10 @@ BidRequest *
 OpenRtbBidRequestParser::
 parseBidRequest(const std::string & jsonValue,
                 const std::string & provider,
-                const std::string & exchange)
+                const std::string & exchange,
+                const std::string & version)
 {
-    return fromOpenRtb(parseBidRequest(jsonValue), provider, exchange);
+    return fromOpenRtb(parseBidRequest(jsonValue), provider, exchange, version);
 }
 
 OpenRTB::BidRequest
@@ -407,9 +445,10 @@ BidRequest *
 OpenRtbBidRequestParser::
 parseBidRequest(ML::Parse_Context & context,
                 const std::string & provider,
-                const std::string & exchange)
+                const std::string & exchange,
+                const std::string & version)
 {
-    return fromOpenRtb(parseBidRequest(context), provider, exchange);
+    return fromOpenRtb(parseBidRequest(context), provider, exchange, version);
 }
 
 } // namespace RTBKIT

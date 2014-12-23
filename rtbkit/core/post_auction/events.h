@@ -13,6 +13,7 @@
 #include "rtbkit/common/auction_events.h"
 #include "soa/types/id.h"
 #include "soa/types/string.h"
+#include "rtbkit/common/analytics_publisher.h"
 
 
 /******************************************************************************/
@@ -77,6 +78,7 @@ struct MatchedWinLoss
     size_t impIndex() const;
 
     void publish(ZmqNamedPublisher& logger) const;
+    void publish(AnalyticsPublisher & logger) const;
 
 private:
     void initFinishedInfo(const FinishedInfo& info);
@@ -99,6 +101,8 @@ struct MatchedCampaignEvent
     Datacratic::Id impId;
     AccountKey account;
 
+    Datacratic::Date timestamp;
+
     Datacratic::UnicodeString requestStr;
     std::shared_ptr<BidRequest> request;
     std::string requestStrFormat;
@@ -114,6 +118,7 @@ struct MatchedCampaignEvent
     size_t impIndex() const;
 
     void publish(ZmqNamedPublisher& logger) const;
+    void publish(AnalyticsPublisher & logger) const;
 };
 
 
@@ -130,6 +135,7 @@ struct UnmatchedEvent
 
     std::string channel() const;
     void publish(ZmqNamedPublisher& logger) const;
+    void publish(AnalyticsPublisher & logger) const;
 };
 
 
@@ -145,6 +151,7 @@ struct PostAuctionErrorEvent
 
     PostAuctionErrorEvent(std::string key, std::string message);
     void publish(ZmqNamedPublisher& logger) const;
+    void publish(AnalyticsPublisher & logger) const;
 };
 
 

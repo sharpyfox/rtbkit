@@ -68,7 +68,8 @@ struct HttpExchangeConnector
                        const std::string & auctionResource = "/auctions",
                        const std::string & auctionVerb = "POST",
                        int realTimePriority = -1,
-                       bool realTimePolling = false);
+                       bool realTimePolling = false,
+                       double absoluteTimeMax = 50.0);
 
     /** Start the exchange connector running */
     virtual void start();
@@ -132,6 +133,18 @@ struct HttpExchangeConnector
     parseBidRequest(HttpAuctionHandler & connection,
                     const HttpHeader & header,
                     const std::string & payload);
+
+    /** This method is called right after the bid request has been parsed and
+     *  the Auction object has been created. This method should be reimplemented
+     *  if you want to modify the auction before it is injected into the router
+     *
+     *  The default implementation of this function does nothing
+     *
+     *  @Postcondition: the auction must not be null
+     */
+    virtual void
+    adjustAuction(std::shared_ptr<Auction>& auction) const;
+
 
     /** Return the available time for the bid request in milliseconds.  This
         method should not parse the bid request, as when shedding load
@@ -267,6 +280,7 @@ protected:
     int backlog;
     std::string auctionResource;
     std::string auctionVerb;
+    double absoluteTimeMax;
 
     /// The ping time to known hosts in milliseconds
     std::unordered_map<std::string, float> pingTimesByHostMs;

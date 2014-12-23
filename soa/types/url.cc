@@ -137,6 +137,20 @@ scheme() const
 
 std::string
 Url::
+username() const
+{
+    return url->username();
+}
+
+std::string
+Url::
+password() const
+{
+    return url->password();
+}
+
+std::string
+Url::
 host() const
 {
     return url->host();
@@ -167,7 +181,9 @@ std::string
 Url::
 path() const
 {
-    return url->path();
+    if (url->scheme() == "file")
+        return url->host() + url->path();
+    else return url->path();
 }
 
 std::string

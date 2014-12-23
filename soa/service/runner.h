@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "soa/types/date.h"
 #include "soa/types/value_description.h"
 
 #include "epoller.h"
@@ -114,11 +115,23 @@ struct Runner: public Epoller {
              const std::shared_ptr<InputSink> & stdErrSink = nullptr);
 
     /** Kill the subprocess with the given signal, then wait for it to
-        terminate. */
-    void kill(int signal = SIGTERM) const;
+        terminate.
 
-    /** Send the given signal, but don't wait for it to terminate. */
-    void signal(int signum);
+        If mustSucceed = true, then an exception will be thrown if there
+        is no process.
+
+        Returns whether or not the call succeeded.
+    */
+    bool kill(int signal = SIGTERM, bool mustSucceed = true) const;
+
+    /** Send the given signal, but don't wait for it to terminate.
+
+        If mustSucceed = true, then an exception will be thrown if there
+        is no process.
+
+        Returns whether or not the call succeeded.
+    */
+    bool signal(int signum, bool mustSucceed = true);
 
     /** Synchronous wait for the subprocess to start.  Returns true if the
         process started, or false if it wasn't able to start.
@@ -127,7 +140,8 @@ struct Runner: public Epoller {
     */
     bool waitStart(double secondsToWait = INFINITY) const;
 
-    /** Synchronous wait for termination of the subprocess. */
+    /** Synchronous wait for termination of the subprocess and the closing of
+     * all related resources. */
     void waitTermination() const;
 
     /** Is the subprocess running? */
@@ -136,6 +150,14 @@ struct Runner: public Epoller {
     /** Process ID of the child process. Returns -1 if not running, -2 in case
         of a launch error, -3 when terminated. */
     pid_t childPid() const { return childPid_; }
+
+    Date startDate() const { return startDate_; }
+    Date endDate() const { return endDate_; }
+
+    /** The number of seconds since the actual start time of the subprocess.
+        If terminated, the actual interval between the start and the
+        termination times thereof. */
+    double duration() const;
 
 private:
     struct Task {
@@ -219,15 +241,18 @@ private:
     };
 
     void prepareChild();
-    bool handleEpollEvent(const struct epoll_event & event);
+    Epoller::HandleEventResult
+    handleEpollEvent(const struct epoll_event & event);
     void handleChildStatus(const struct epoll_event & event);
     void handleOutputStatus(const struct epoll_event & event,
-                            int fd, std::shared_ptr<InputSink> & sink);
+                            int & fd, std::shared_ptr<InputSink> & sink);
     void handleWakeup(const struct epoll_event & event);
 
     void attemptTaskTermination();
 
     int running_;
+    Date startDate_;
+    Date endDate_;
 
     /** Holds the child PID if > 0.  If not:
         -1 means the child has not launched yet

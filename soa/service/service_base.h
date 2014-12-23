@@ -87,9 +87,11 @@ struct CarbonEventService : public EventService {
 
     CarbonEventService(std::shared_ptr<CarbonConnector> conn);
     CarbonEventService(const std::string & connection,
-                       const std::string & prefix = "");
+                       const std::string & prefix = "",
+                       double dumpInterval = 1.0);
     CarbonEventService(const std::vector<std::string> & connections,
-                       const std::string & prefix = "");
+                       const std::string & prefix = "",
+                       double dumpInterval = 1.0);
 
     virtual void onEvent(const std::string & name,
                          const char * event,
@@ -281,10 +283,10 @@ struct ConfigurationService {
     static std::pair<std::string, std::string>
     splitPath(const std::string & path);
 
-    /** Store the current hostname and location
+    /** Store the current installation and location
      */
 
-    std::string currentHostname;
+    std::string currentInstallation;
     std::string currentLocation;
 };
 
@@ -394,6 +396,9 @@ struct ServiceProxies {
     std::shared_ptr<EventService> events;
     std::shared_ptr<ConfigurationService> config;
     std::shared_ptr<PortRangeService> ports;
+    Json::Value params;
+
+    std::string bankerUri;
 
     /** Zeromq context for communication. */
     std::shared_ptr<zmq::context_t> zmqContext;
@@ -407,9 +412,11 @@ struct ServiceProxies {
 
     void logToCarbon(std::shared_ptr<CarbonConnector> conn);
     void logToCarbon(const std::string & carbonConnection,
-                     const std::string & prefix = "");
+                     const std::string & prefix = "",
+                     double dumpInterval = 1.0);
     void logToCarbon(const std::vector<std::string> & carbonConnections,
-                     const std::string & prefix = "");
+                     const std::string & prefix = "",
+                     double dumpInterval = 1.0);
 
     void useZookeeper(std::string url = "localhost:2181",
                       std::string prefix = "CWD",
@@ -652,6 +659,10 @@ struct ServiceBase: public EventRecorder {
     
     void registerServiceProvider(const std::string & name,
                                  const std::vector<std::string> & serviceClasses);
+
+    void registerShardedServiceProvider(const std::string & name,
+                                        const std::vector<std::string> & serviceClasses,
+                                        size_t shardIndex);
 
     /** Unregister service from configuration service. */
 

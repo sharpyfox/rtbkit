@@ -7,7 +7,7 @@
 #include <iterator> // std::begin
 
 #include "bidswitch_exchange_connector.h"
-#include "rtbkit/plugins/bid_request/openrtb_bid_request.h"
+#include "rtbkit/plugins/bid_request/openrtb_bid_request_parser.h"
 #include "rtbkit/plugins/exchange/http_auction_handler.h"
 #include "rtbkit/core/agent_configuration/agent_config.h"
 #include "rtbkit/openrtb/openrtb_parsing.h"
@@ -35,17 +35,33 @@ Logging::Category bidswitchExchangeConnectorError("[ERROR] Bidswitch Exchange Co
 
 BidSwitchExchangeConnector::
 BidSwitchExchangeConnector(ServiceBase & owner, const std::string & name)
-    : OpenRTBExchangeConnector(owner, name) {
+    : OpenRTBExchangeConnector(owner, name),
+    configuration_("bidswitch") {
     this->auctionResource = "/auctions";
     this->auctionVerb = "POST";
+    init();
 }
 
 BidSwitchExchangeConnector::
 BidSwitchExchangeConnector(const std::string & name,
                            std::shared_ptr<ServiceProxies> proxies)
-    : OpenRTBExchangeConnector(name, proxies) {
+    : OpenRTBExchangeConnector(name, proxies),
+      configuration_("bidswitch") {
     this->auctionResource = "/auctions";
     this->auctionVerb = "POST";
+    init();
+}
+
+void
+BidSwitchExchangeConnector::init() {
+
+    // nurl might contain macros
+    configuration_.addField(
+        "nurl",
+        [](const Json::Value & value, CreativeInfo & data) {
+            Datacratic::jsonDecode(value, data.nurl);
+            return true;
+        }).optional().snippet();
 }
 
 namespace {
@@ -64,7 +80,6 @@ std::vector<int> stringsToInts(const Json::Value& value) {
     return ints;
 }
 }
-
 
 ExchangeConnector::ExchangeCompatibility
 BidSwitchExchangeConnector::
@@ -85,6 +100,15 @@ getCampaignCompatibility(const AgentConfig & config,
     } catch (const std::exception & exc) {
         result.setIncompatible
         (string("providerConfig.bidswitch.iurl parsing error: ")
+         + exc.what(), includeReasons);
+        return result;
+    }
+
+    try {
+        cpinfo->seat = Id(pconf["seat"].asString());
+    } catch (const std::exception & exc) {
+        result.setIncompatible
+        (string("providerConfig.bidswitch.seat parsing error: ")
          + exc.what(), includeReasons);
         return result;
     }
@@ -177,6 +201,10 @@ getCreativeCompatibility(const Creative & creative,
             crinfo->Google.attribute_ = { std::begin(ints), std::end(ints) };
         }
     }
+    
+    // Don't care about result since it's only an optional macro
+    configuration_.handleCreativeCompatibility(creative, includeReasons);
+
     return result;
 }
 
@@ -261,7 +289,7 @@ parseBidRequest(HttpAuctionHandler & connection,
 
     // Parse the bid request
     ML::Parse_Context context("Bid Request", payload.c_str(), payload.size());
-    res.reset(OpenRtbBidRequestParser::parseBidRequest(context, exchangeName(), exchangeName()));
+    res.reset(OpenRTBBidRequestParser::openRTBBidRequestParserFactory("2.2")->parseBidRequest(context, exchangeName(), exchangeName()));
 
     return res;
 }
@@ -321,7 +349,7 @@ setSeatBid(Auction const & auction,
     b.id = Id(auction.id, auction.request->imp[0].id);
     b.impid = auction.request->imp[spotNum].id;
     b.price.val = USD_CPM(resp.price.maxPrice);
-    b.nurl = crinfo->nurl;
+    b.nurl = configuration_.expand(crinfo->nurl, {creative, resp, *auction.request});
     b.adid = crinfo->adid;
     b.adomain = crinfo->adomain;
     b.iurl = cpinfo->iurl;
@@ -385,6 +413,7 @@ using namespace RTBKIT;
 struct Init {
     Init() {
         ExchangeConnector::registerFactory<BidSwitchExchangeConnector>();
+        FilterRegistry::registerFilter<BidSwitchWSeatFilter>();
     }
 } init;
 }

@@ -4,10 +4,12 @@
    Copyright (c) 2013 Datacratic Inc.  All rights reserved.
 */
 
+#include <string>
 #include "post_auction_runner.h"
 #include "post_auction_service.h"
 #include "rtbkit/core/banker/slave_banker.h"
 #include "soa/service/service_utils.h"
+#include "soa/service/process_stats.h"
 #include "soa/utils/print_utils.h"
 #include "jml/utils/file_functions.h"
 
@@ -20,6 +22,10 @@ using namespace boost::program_options;
 using namespace Datacratic;
 using namespace RTBKIT;
 
+Logging::Category PostAuctionRunner::print("PostAuctionRunner");
+Logging::Category PostAuctionRunner::error("PostAuctionRUnner Error", PostAuctionRunner::print);
+Logging::Category PostAuctionRunner::trace("PostAuctionRunner Trace", PostAuctionRunner::print);
+
 static Json::Value loadJsonFromFile(const std::string & filename)
 {
     ML::File_Read_Buffer buf(filename);
@@ -31,10 +37,14 @@ static Json::Value loadJsonFromFile(const std::string & filename)
 /************************************************************************/
 PostAuctionRunner::
 PostAuctionRunner() :
-    shards(1),
+    shard(0),
     auctionTimeout(EventMatcher::DefaultAuctionTimeout),
     winTimeout(EventMatcher::DefaultWinTimeout),
-    bidderConfigurationFile("rtbkit/examples/bidder-config.json")
+    bidderConfigurationFile("rtbkit/examples/bidder-config.json"),
+    winLossPipeTimeout(PostAuctionService::DefaultWinLossPipeTimeout),
+    campaignEventPipeTimeout(PostAuctionService::DefaultCampaignEventPipeTimeout),
+    analyticsOn(false),
+    analyticsConnections(1)
 {
 }
 
@@ -49,17 +59,26 @@ doOptions(int argc, char ** argv,
     postAuctionLoop_options.add_options()
         ("bidder,b", value<string>(&bidderConfigurationFile),
          "configuration file with bidder interface data")
-        ("shards", value<size_t>(&shards),
-         "Number of shards(threads) used for matching.")
+        ("shard,s", value<size_t>(&shard),
+         "Shard index starting at 0 for this post auction loop")
         ("win-seconds", value<float>(&winTimeout),
          "Timeout for storing win auction")
         ("auction-seconds", value<float>(&auctionTimeout),
-         "Timeout to get late win auction");
+         "Timeout to get late win auction")
+        ("winlossPipe-seconds", value<int>(&winLossPipeTimeout),
+         "Timeout before sending error on WinLoss pipe")
+        ("campaignEventPipe-seconds", value<int>(&campaignEventPipeTimeout),
+         "Timeout before sending error on CampaignEvent pipe")
+        ("analytics,a", bool_switch(&analyticsOn),
+         "Send data to analytics logger.")
+        ("analytics-connections", value<int>(&analyticsConnections),
+         "Number of connections for the analytics publisher.");
 
     options_description all_opt = opts;
     all_opt
         .add(serviceArgs.makeProgramOptions())
-        .add(postAuctionLoop_options);
+        .add(postAuctionLoop_options)
+        .add(bankerArgs.makeProgramOptions());
 
     all_opt.add_options()
         ("help,h","print this message");
@@ -88,17 +107,31 @@ init()
 
     postAuctionLoop = std::make_shared<PostAuctionService>(proxies, serviceName);
     postAuctionLoop->initBidderInterface(bidderConfig);
-    postAuctionLoop->init(shards);
+    postAuctionLoop->init(shard);
 
     postAuctionLoop->setWinTimeout(winTimeout);
     postAuctionLoop->setAuctionTimeout(auctionTimeout);
+    postAuctionLoop->setWinLossPipeTimeout(winLossPipeTimeout);
+    postAuctionLoop->setCampaignEventPipeTimeout(campaignEventPipeTimeout);
 
-    LOG(PostAuctionService::print) << "win timeout is " << winTimeout << std::endl;
-    LOG(PostAuctionService::print) << "auction timeout is " << auctionTimeout << std::endl;
+    LOG(print) << "win timeout is " << winTimeout << std::endl;
+    LOG(print) << "auction timeout is " << auctionTimeout << std::endl;
+    LOG(print) << "winLoss pipe timeout is " << winLossPipeTimeout << std::endl;
+    LOG(print) << "campaignEvent pipe timeout is " << campaignEventPipeTimeout << std::endl;
 
-    banker = std::make_shared<SlaveBanker>(proxies->zmqContext,
-            proxies->config,
-            postAuctionLoop->serviceName() + ".slaveBanker");
+    banker = bankerArgs.makeBankerWithArgs(proxies,
+                                           postAuctionLoop->serviceName() + ".slaveBanker",
+                                           SlaveBanker::DefaultSpendRate,
+                                           bankerArgs.batched);
+
+    if (analyticsOn) {
+        const auto & analyticsUri = proxies->params["analytics-uri"].asString();
+        if (!analyticsUri.empty()) {
+            postAuctionLoop->initAnalytics(analyticsUri, analyticsConnections);
+        }
+        else
+            LOG(print) << "analytics-uri is not in the config" << endl;
+    }
 
     postAuctionLoop->addSource("slave-banker", *banker);
     postAuctionLoop->setBanker(banker);
@@ -151,8 +184,21 @@ report( const PostAuctionService& service,
     return current;
 }
 
+void setMemoryLimit()
+{
+    rlimit64 currentLimit;
+    int status = getrlimit64(RLIMIT_AS, &currentLimit);
+    if(status != 0)
+        throw ML::Exception("Failed to get the current system limits");
+
+    currentLimit.rlim_cur = 1UL << 36;// 64G
+    if(setrlimit64(RLIMIT_AS, &currentLimit) != 0)
+        throw ML::Exception("Failed to set the current system limits to 512G");
+}
+
 int main(int argc, char ** argv)
 {
+    setMemoryLimit();
 
     PostAuctionRunner runner;
 
@@ -161,9 +207,21 @@ int main(int argc, char ** argv)
     runner.start();
 
     auto stats = report(*runner.postAuctionLoop, 0.1);
-    for (;;) {
-        ML::sleep(10.0);
-        stats = report(*runner.postAuctionLoop, 10.0, stats);
+    ProcessStats lastStats;
+
+    auto onStat = [&] (std::string key, double val) {
+        runner.postAuctionLoop->recordStableLevel(val, key);
+    };
+
+    for (size_t i = 0;; ++i) {
+        ML::sleep(1.0);
+
+        ProcessStats curStats;
+        ProcessStats::logToCallback(onStat, lastStats, curStats, "process");
+        lastStats = curStats;
+
+        if (i % 10 == 0)
+            stats = report(*runner.postAuctionLoop, 10.0, stats);
     }
 
 }

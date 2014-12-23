@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <boost/thread/thread.hpp>
+#include <thread>
 #include <functional>
 
 #include "jml/arch/wakeup_fd.h"
@@ -16,9 +16,21 @@
 #include "epoller.h"
 #include "async_event_source.h"
 #include "typed_message_channel.h"
+#include "logs.h"
 
 namespace Datacratic {
 
+/******************************************************************************/
+/* LOGS                                                                       */
+/******************************************************************************/
+
+struct MessageLoopLogs
+{
+    static Logging::Category print;
+    static Logging::Category warning;
+    static Logging::Category error;
+    static Logging::Category trace;
+};
 
 /*****************************************************************************/
 /* MESSAGE LOOP                                                              */
@@ -38,8 +50,6 @@ struct MessageLoop : public Epoller {
 
     void startSync();
     
-    //void sleepUntilIdle();
-
     void shutdown();
 
     /** Add the given source of asynchronous wakeups with the given
@@ -65,17 +75,6 @@ struct MessageLoop : public Epoller {
     bool addSource(const std::string & name,
                    const std::shared_ptr<AsyncEventSource> & source,
                    int priority = 0);
-
-    /** Add the given source of asynchronous wakeups with the given
-        callback to be run when they trigger.
-
-        CAUTION: this function call will take effect immediately but is not
-        thread-safe and is to be used only when it is known that the
-        MessageLoop has not started yet.
-    */
-    void addSourceRightAway(const std::string & name,
-                            const std::shared_ptr<AsyncEventSource> & source,
-                            int priority = 0);
 
     /** Add a periodic job to be performed by the loop.  The number passed
         to the toRun function is the number of timeouts that have elapsed
@@ -111,6 +110,18 @@ struct MessageLoop : public Epoller {
         is deferred to the main message loop thread.
      */
     bool removeSource(AsyncEventSource * source);
+
+    /** Remove the given source from the list of active sources and waits for
+        the operation to complete. Useful in the cases where you need to destroy
+        the resources associated with the source.
+
+        WARNING: Calling this function from the message loop thread will result
+        in a deadlock.
+
+        \todo We need a callback version for the removeSource functions to fix
+        the above warning.
+    */
+    bool removeSourceSync(AsyncEventSource * source);
 
     /** Re-check if anything needs to poll. */
     void checkNeedsPoll();
@@ -163,15 +174,15 @@ private:
     };
 
     /* Queue of source actions to perform */
-    TypedMessageSink<SourceAction> sourceActions_;
+    TypedMessageQueue<SourceAction> sourceActions_;
     // ML::Wakeup_Fd queueFd;
 
     Lock threadsLock;
     int numThreadsCreated;
-    boost::thread_group threads;
+    std::vector<std::thread> threads;
     
     /** Global flag to shutdown. */
-    int shutdown_;
+    volatile int shutdown_;
 
     /** Do we debug? */
     bool debug_;
@@ -184,8 +195,8 @@ private:
     */
     double maxAddedLatency_;
 
-    bool handleEpollEvent(epoll_event & event);
-    void handleSourceAction(SourceAction && action);
+    Epoller::HandleEventResult handleEpollEvent(epoll_event & event);
+    void handleSourceActions();
     void processAddSource(const SourceEntry & entry);
     void processRemoveSource(const SourceEntry & entry);
 };

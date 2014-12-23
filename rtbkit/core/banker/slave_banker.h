@@ -8,11 +8,18 @@
 #ifndef __banker__slave_banker_h__
 #define __banker__slave_banker_h__
 
+#include <atomic>
 #include "banker.h"
+#include "application_layer.h"
 #include "soa/service/zmq_endpoint.h"
 #include "soa/service/typed_message_channel.h"
-#include "soa/service/rest_proxy.h"
+#include "soa/service/logs.h"
+#include "jml/arch/spinlock.h"
 #include <thread>
+#include <atomic>
+
+#include <boost/program_options/cmdline.hpp>
+#include <boost/program_options/options_description.hpp>
 
 namespace RTBKIT {
 
@@ -25,7 +32,7 @@ namespace RTBKIT {
  */
 
 struct SlaveBudgetController
-    : public BudgetController, public Accountant, public RestProxy  {
+    : public BudgetController, public Accountant, public MessageLoop  {
 
     SlaveBudgetController();
 
@@ -34,10 +41,12 @@ struct SlaveBudgetController
         shutdown();
     }
 
-    void init(std::shared_ptr<ConfigurationService> config,
-              const std::string & serviceClass = "rtbBanker")
+
+    void setApplicationLayer(const std::shared_ptr<ApplicationLayer> &layer)
     {
-        RestProxy::initServiceClass(config, serviceClass, "zeromq");
+        ExcCheck(layer != nullptr, "Layer can not be null");
+        applicationLayer = layer;
+        addSource("SlaveBudgetController::ApplicationLayer", *layer);
     }
 
     virtual void addAccount(const AccountKey & account,
@@ -72,7 +81,11 @@ struct SlaveBudgetController
                std::function<void (std::exception_ptr,
                                    Account &&)> onResult);
 
-    static OnDone budgetResultCallback(const OnBudgetResult & onResult);
+    static std::shared_ptr<HttpClientSimpleCallbacks>
+    budgetResultCallback(const SlaveBudgetController::OnBudgetResult & onResult);
+private:
+    std::shared_ptr<ApplicationLayer> applicationLayer;
+    //std::shared_ptr<HttpClient> httpClient;
 };
 
 
@@ -84,32 +97,30 @@ struct SlaveBudgetController
     big block of budget into individual auctions and keeps track of
     what has been committed so far.
 */
-struct SlaveBanker : public Banker, public RestProxy {
+struct SlaveBanker : public Banker, public MessageLoop {
+    static const CurrencyPool DefaultSpendRate;
 
-    SlaveBanker(std::shared_ptr<zmq::context_t> context);
+    SlaveBanker();
 
     ~SlaveBanker()
     {
         shutdown();
     }
 
-    SlaveBanker(std::shared_ptr<zmq::context_t> context,
-                std::shared_ptr<ConfigurationService> config,
-                const std::string & accountSuffix,
-                const std::string & bankerServiceClass = "rtbBanker");
+    SlaveBanker(const std::string & accountSuffix,
+            CurrencyPool spendRate = DefaultSpendRate,
+            bool batchedUpdates = false);
 
-    /** Initialize the slave banker.  This will connect it to the master
-        banker (that it will discover using the configuration service
-        under the bankerServiceName).
+    /** Initialize the slave banker.  
 
         The accountSuffix parameter is used to name spend accounts underneath
         the given budget accounts (to disambiguate between multiple
         accessors of those accounts).  It must be unique across the entire
         system, but should be consistent from one invocation to another.
     */
-    void init(std::shared_ptr<ConfigurationService> config,
-              const std::string & accountSuffix,
-              const std::string & serviceClass = "rtbBanker");
+    void init(const std::string & accountSuffix,
+              CurrencyPool spendRate = DefaultSpendRate,
+              bool batchedUpdates = false);
 
     /** Notify the banker that we're going to need to be spending some
         money for the given account.  We also keep track of how much
@@ -194,11 +205,44 @@ struct SlaveBanker : public Banker, public RestProxy {
         return accounts.getAccount(accountKey);
     }
 
+    void setApplicationLayer(const std::shared_ptr<ApplicationLayer> &layer)
+    {
+        applicationLayer = layer;
+        addSource("SlaveBanker::ApplicationLayer", *layer);
+    }
+
+    bool isReauthorizing() const
+    {
+        return reauthorizing;
+    }
+
+    void waitReauthorized() const;
+
+    size_t getNumReauthorized()
+        const
+    {
+        return numReauthorized;
+    }
+
+    double getLastReauthorizeDelay()
+        const
+    {
+        return lastReauthorizeDelay;
+    }
+
     /* Logging */
     virtual void logBidEvents(const Datacratic::EventRecorder & eventRecorder)
     {
         accounts.logBidEvents(eventRecorder);
     }
+
+    /* Monitor */
+    virtual MonitorIndicator getProviderIndicators() const;
+
+    /* Logs */
+    static Logging::Category print;
+    static Logging::Category trace;
+    static Logging::Category error;
 
 private:    
     ShadowAccounts accounts;
@@ -207,6 +251,13 @@ private:
     /// created and must therefore be synchronized
     TypedMessageSink<AccountKey> createdAccounts;
     std::string accountSuffix;
+
+    std::shared_ptr<ApplicationLayer> applicationLayer;
+    typedef ML::Spinlock Lock;
+    mutable Lock syncLock;
+    Datacratic::Date lastSync;
+    Datacratic::Date lastReauthorize;
+
     
     /** Periodically we report spend to the banker.*/
     void reportSpend(uint64_t numTimeoutsExpired);
@@ -214,7 +265,8 @@ private:
 
     /** Periodically we ask the banker to re-authorize our budget. */
     void reauthorizeBudget(uint64_t numTimeoutsExpired);
-    Date reauthorizeBudgetSent;
+    CurrencyPool spendRate;
+
 
     /// Called when we get an account status back from the master banker
     /// after a synchrnonization
@@ -244,8 +296,73 @@ private:
     {
         return account.childKey(accountSuffix).toString();
     }
+
+    void reauthorizeBudgetBatched(uint64_t numTimeoutsExpired);
+    void onReauthorizeBudgetBatchedResponse(
+            std::exception_ptr exc, int code, const std::string& payload);
+
+    std::atomic<bool> shutdown_;
+    std::atomic<bool> reauthorizing;
+    Date reauthorizeDate;
+    double lastReauthorizeDelay;
+    size_t numReauthorized;
+    size_t accountsLeft;
 };
 
-} // naemspace RTBKIT
+/*****************************************************************************/
+/* SLAVE BANKER ARGUMENTS                                                     */
+/*****************************************************************************/
+
+/** Class used to automatically create a SlaveBanker. This class can be used
+ *  by all the components that need a SlaveBanker (router and post auction service)
+ */
+class SlaveBankerArguments
+{
+public:
+    struct Defaults {
+        static constexpr bool UseHttp = false;
+        static constexpr bool Batched = false;
+        static constexpr int HttpConnections = 1 << 3;
+        static constexpr bool TcpNoDelay = false;
+    };
+
+    SlaveBankerArguments();
+
+    boost::program_options::options_description
+    makeProgramOptions(std::string title = "Slave banker options");
+
+    void validate() const;
+
+    /** Create a SlaveBanker by calling the default constructor */
+    std::shared_ptr<SlaveBanker> makeBankerDefault(
+            std::shared_ptr<ServiceProxies> proxies) const;
+
+    /** Create a SlaveBanker by forwarding the arguments to the constructor */
+    template<typename... Args>
+    std::shared_ptr<SlaveBanker> makeBankerWithArgs(
+            std::shared_ptr<ServiceProxies> proxies, Args&& ...args) const {
+
+        auto banker = std::make_shared<SlaveBanker>(std::forward<Args>(args)...);
+
+        banker->setApplicationLayer(makeApplicationLayer(std::move(proxies)));
+        return banker;
+    }
+
+    static Logging::Category print;
+    static Logging::Category trace;
+    static Logging::Category error;
+
+    bool batched;
+
+private:
+    bool useHttp;
+    int httpConnections;
+    bool tcpNoDelay;
+
+    std::shared_ptr<ApplicationLayer> makeApplicationLayer(
+            std::shared_ptr<ServiceProxies> proxies) const;
+};
+
+} // namespace RTBKIT
 
 #endif /* __banker__slave_banker_h__ */

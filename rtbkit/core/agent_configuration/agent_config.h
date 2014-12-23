@@ -16,6 +16,7 @@
 #include "rtbkit/common/bid_request.h"
 #include "include_exclude.h"
 #include "rtbkit/common/account_key.h"
+#include "rtbkit/core/agent_configuration/latlonrad.h"
 
 namespace RTBKIT {
 
@@ -79,6 +80,24 @@ struct Creative {
     IncludeExclude<std::string> languageFilter;
     IncludeExclude<CachedRegex<boost::u32regex, Datacratic::UnicodeString> > locationFilter;
     IncludeExclude<std::string> exchangeFilter;
+
+    struct SegmentInfo {
+
+        SegmentInfo() : excludeIfNotPresent(false){}
+
+        bool excludeIfNotPresent;
+        SegmentList include;
+        SegmentList exclude;
+
+        void fromJson(const Json::Value & val);
+
+        Json::Value toJson() const;
+
+        IncludeExcludeResult process(const SegmentList & segments) const;
+
+    };
+
+    std::map<std::string, SegmentInfo> segments;
 
     /** Is the given ad spot compatible with the given creative format? */
     bool compatible(const AdSpot & spot) const;
@@ -255,12 +274,16 @@ struct AgentConfig {
 
     int maxInFlight;
 
+    std::string bidderInterface;
+
     std::vector<std::string> requiredIds;
 
     IncludeExclude<DomainMatcher> hostFilter;
     IncludeExclude<CachedRegex<boost::regex, std::string> > urlFilter;
     IncludeExclude<CachedRegex<boost::regex, std::string> > languageFilter;
     IncludeExclude<CachedRegex<boost::u32regex, Datacratic::UnicodeString> > locationFilter;
+    LatLonRadList latLongDevFilter; // latitude and longitude device filter
+
 
     struct SegmentInfo {
         SegmentInfo()
@@ -366,63 +389,6 @@ struct AgentConfig {
 
     /** Message formats */
     BidResultFormat winFormat, lossFormat, errorFormat;
-
-    /** Returns a list of (adspot, [creatives]) pairs compatible with this
-        agent.
-    */
-    BiddableSpots
-    canBid(const ExchangeConnector * exchangeConnector,
-           const BidRequest& request,
-           const Datacratic::UnicodeString & language,
-           const Datacratic::UnicodeString & location, uint64_t locationHash,
-           ML::Lightweight_Hash<uint64_t, int> & locationCache) const;
-
-
-    /** Cache used to speed up successive calls to isBiddableRequest() for a
-        given request.
-    */
-    struct RequestFilterCache
-    {
-        RequestFilterCache(const BidRequest& request) :
-            urlHash(hashString(request.url.c_str())),
-
-            language(!request.language.empty() ?
-                     request.language : Datacratic::UnicodeString("unspecified")),
-            languageHash(hashString(request.language)),
-
-            location(request.location.fullLocationString()),
-            locationHash(hashString(location))
-        {}
-
-        uint64_t urlHash;
-
-        Datacratic::UnicodeString language;
-        uint64_t languageHash;
-
-        Datacratic::UnicodeString location;
-        uint64_t locationHash;
-
-        // Cache of regex -> bool
-        ML::Lightweight_Hash<uint64_t, int> urlFilter;
-        ML::Lightweight_Hash<uint64_t, int> languageFilter;
-        ML::Lightweight_Hash<uint64_t, int> locationFilter;
-    };
-
-    typedef std::function<void(const char*)> FilterStatFn;
-
-    /** Returns the biddable imp (see canBid) if the agent can bid on the
-        given bid request.
-
-        Before the function returns false, doFilterStat will be called with the
-        cause of the filtering and the appropriate member of AgentStats will be
-        incremented.
-    */
-    BiddableSpots
-    isBiddableRequest(const ExchangeConnector * exchange,
-                      const BidRequest& request,
-                      AgentStats& stats,
-                      RequestFilterCache& cache,
-                      const FilterStatFn & doFilterStat = FilterStatFn()) const;
 };
 
 

@@ -89,7 +89,12 @@ BOOST_AUTO_TEST_CASE( test_asyncfdoutputsink_hup )
 }
 #endif
 
-#if 1
+#if 0
+/* Disabled test because of the time it requires, for a feature we know is
+ * working. */
+
+/* Ensures that the all messages are sent and in correct order, in spite of
+ * the bursting of the queue */
 BOOST_AUTO_TEST_CASE( test_asyncfdoutputsink_many_msgs )
 {
     const int nmsgs(200000);
@@ -129,7 +134,7 @@ BOOST_AUTO_TEST_CASE( test_asyncfdoutputsink_many_msgs )
         sprintf(buffer, "%.4x\n", i);
         string message = basemsg + string(buffer, 4);
         while (sink.state == OutputSink::OPEN
-               && !sink.write(move(message))) {
+               && !sink.write(string(message))) {
             cerr << "retrying at " + to_string(i) << endl;
         }
 

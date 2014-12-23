@@ -57,7 +57,16 @@ struct S3UrlFsHandler : public UrlFsHandler {
     {
         string bucket = url.host();
         auto api = getS3ApiForBucket(bucket);
-        return api->getObjectInfo(bucket, url.path().substr(1));
+        auto bucketPath = S3Api::parseUri(url.original);
+        return api->getObjectInfo(bucket, bucketPath.second);
+    }
+
+    virtual FsObjectInfo tryGetInfo(const Url & url) const
+    {
+        string bucket = url.host();
+        auto api = getS3ApiForBucket(bucket);
+        auto bucketPath = S3Api::parseUri(url.original);
+        return api->tryGetObjectInfo(bucket, bucketPath.second);
     }
 
     virtual void makeDirectory(const Url & url) const
@@ -68,12 +77,13 @@ struct S3UrlFsHandler : public UrlFsHandler {
     {
         string bucket = url.host();
         auto api = getS3ApiForBucket(bucket);
+        auto bucketPath = S3Api::parseUri(url.original);
         if (throwException) {
-            api->eraseObject(bucket, url.path());
+            api->eraseObject(bucket, "/" + bucketPath.second);
             return true;
         }
         else { 
-            return api->tryEraseObject(bucket, url.path());
+            return api->tryEraseObject(bucket, "/" + bucketPath.second);
         }
     }
 
@@ -127,6 +137,13 @@ struct AtInit {
 
 namespace Datacratic {
 
+S3ConfigDescription::
+S3ConfigDescription()
+{
+    addField("accessKeyId", &S3Config::accessKeyId, "");
+    addField("accessKey", &S3Config::accessKey, "");
+}
+
 std::string
 S3Api::
 s3EscapeResource(const std::string & str)
@@ -154,6 +171,8 @@ s3EscapeResource(const std::string & str)
 double
 S3Api::
 defaultBandwidthToServiceMbps = 20.0;
+
+S3Api::Range S3Api::Range::Full(0);
 
 S3Api::
 S3Api()
@@ -243,10 +262,13 @@ performSync() const
     }
 
     Range currentRange = params.downloadRange;
-    bool useRange(false);
-    if (params.verb == "GET") {
-        useRange = true;
-    }
+
+    /* The "Range" header is only useful with GET and when the range is
+       explicitly specified. The use of Range::Full means that we always
+       request the full body, even during retries. This is mainly useful for
+       requests on non-object urls, where that header is ignored by the S3
+       servers. */
+    bool useRange = (params.verb == "GET" && currentRange != Range::Full);
 
     string body;
     for (int i = 0; i < numRetries; ++i) {
@@ -670,7 +692,7 @@ S3Api::isMultiPartUploadInProgress(
     string outputPrefix(resource, 1);
 
     // Check if there is already a multipart upload in progress
-    auto inProgressReq = get(bucket, "/", 8192, "uploads", {},
+    auto inProgressReq = get(bucket, "/", Range::Full, "uploads", {},
                              { { "prefix", outputPrefix } });
 
     //cerr << inProgressReq.bodyXmlStr() << endl;
@@ -725,7 +747,7 @@ obtainMultiPartUpload(const std::string & bucket,
     if (requirements != UR_FRESH) {
 
         // Check if there is already a multipart upload in progress
-        auto inProgressReq = get(bucket, "/", 8192, "uploads", {},
+        auto inProgressReq = get(bucket, "/", Range::Full, "uploads", {},
                                  { { "prefix", outputPrefix } });
 
         //cerr << "in progress requests:" << endl;
@@ -767,7 +789,7 @@ obtainMultiPartUpload(const std::string & bucket,
             continue;
 
             // TODO: check metadata, etc
-            auto inProgressInfo = getEscaped(bucket, escapedResource, 8192,
+            auto inProgressInfo = getEscaped(bucket, escapedResource, Range::Full,
                                              "uploadId=" + uploadId)
                 .bodyXml();
 
@@ -907,7 +929,7 @@ upload(const char * data,
 
     if (check == CM_SIZE || check == CM_MD5_ETAG) {
         auto existingResource
-            = get(bucket, "/", 8192, "", {},
+            = get(bucket, "/", Range::Full, "", {},
                   { { "prefix", outputPrefix } })
             .bodyXml();
 
@@ -1164,8 +1186,6 @@ forEachObject(const std::string & bucket,
 {
     using namespace tinyxml2;
 
-    // cerr << "forEachObject under " << prefix << endl;
-
     string marker = startAt;
     // bool firstIter = true;
     do {
@@ -1179,7 +1199,7 @@ forEachObject(const std::string & bucket,
         if (marker != "")
             queryParams.push_back({"marker", marker});
 
-        auto listingResult = get(bucket, "/", 8192, "",
+        auto listingResult = get(bucket, "/", Range::Full, "",
                                  {}, queryParams);
         auto listingResultXml = listingResult.bodyXml();
 
@@ -1298,7 +1318,7 @@ getObjectInfoFull(const std::string & bucket, const std::string & object)
     StrPairVector queryParams;
     queryParams.push_back({"prefix", object});
 
-    auto listingResult = getEscaped(bucket, "/", 8192, "", {}, queryParams);
+    auto listingResult = getEscaped(bucket, "/", Range::Full, "", {}, queryParams);
 
     if (listingResult.code_ != 200) {
         cerr << listingResult.bodyXmlStr() << endl;
@@ -1362,7 +1382,7 @@ tryGetObjectInfoFull(const std::string & bucket, const std::string & object)
     StrPairVector queryParams;
     queryParams.push_back({"prefix", object});
 
-    auto listingResult = get(bucket, "/", 8192, "", {}, queryParams);
+    auto listingResult = get(bucket, "/", Range::Full, "", {}, queryParams);
     if (listingResult.code_ != 200) {
         cerr << listingResult.bodyXmlStr() << endl;
         throw ML::Exception("error getting object request: %d",
@@ -1636,16 +1656,12 @@ size_t getTotalSystemMemory()
 }
 
 struct StreamingDownloadSource {
-
-    StreamingDownloadSource(const S3Api * owner,
-                            const std::string & bucket,
-                            const std::string & object)
+    StreamingDownloadSource(const std::string & urlStr)
     {
         impl.reset(new Impl());
-        impl->owner = owner;
-        impl->bucket = bucket;
-        impl->object = object;
-        impl->info = owner->getObjectInfo(bucket, object);
+        impl->owner = getS3ApiForUri(urlStr);
+        std::tie(impl->bucket, impl->object) = S3Api::parseUri(urlStr);
+        impl->info = impl->owner->getObjectInfo(urlStr);
         impl->baseChunkSize = 1024 * 1024;  // start with 1MB and ramp up
 
         int numThreads = 1;
@@ -1669,7 +1685,7 @@ struct StreamingDownloadSource {
 
     struct Impl {
         Impl()
-            : owner(0), baseChunkSize(0)
+            : baseChunkSize(0)
         {
             reset();
         }
@@ -1680,7 +1696,7 @@ struct StreamingDownloadSource {
         }
 
         /* static variables, set during or right after construction */
-        const S3Api * owner;
+        shared_ptr<S3Api> owner;
         std::string bucket;
         std::string object;
         S3Api::ObjectInfo info;
@@ -1852,12 +1868,20 @@ struct StreamingDownloadSource {
                     auto partResult
                         = owner->get(bucket, "/" + object,
                                      S3Api::Range(start, chunkSize));
+                    
                     if (partResult.code_ != 206) {
                         throw ML::Exception("http error "
                                             + to_string(partResult.code_)
                                             + " while getting part "
                                             + partResult.bodyXmlStr());
                     }
+                    // it can sometimes happen that a file changes during download
+                    // i.e it is being overwritten. Make sure we check for this condition
+                    // and throw an appropriate exception
+                    string chunkEtag = partResult.getHeader("etag") ;
+                    if(chunkEtag != info.etag)
+                        throw ML::Exception("chunk etag %s not equal to file etag %s: file <%s> has changed during download!!", chunkEtag.c_str(), info.etag.c_str(), object.c_str());
+                    ExcAssert(partResult.body().size() == chunkSize);
 
                     while (true) {
                         if (shutdown || lastExc) {
@@ -1904,33 +1928,34 @@ struct StreamingDownloadSource {
     }
 };
 
-std::auto_ptr<std::streambuf>
-S3Api::
-streamingDownload(const std::string & bucket,
-                  const std::string & object,
-                  ssize_t startOffset,
-                  ssize_t endOffset,
-                  const OnChunk & onChunk) const
+std::unique_ptr<std::streambuf>
+makeStreamingDownload(const std::string & uri)
 {
-    std::auto_ptr<std::streambuf> result;
+    std::unique_ptr<std::streambuf> result;
     result.reset(new boost::iostreams::stream_buffer<StreamingDownloadSource>
-                 (StreamingDownloadSource(this, bucket, object),
+                 (StreamingDownloadSource(uri),
                   131072));
     return result;
 }
 
+std::unique_ptr<std::streambuf>
+makeStreamingDownload(const std::string & bucket,
+                      const std::string & object)
+{
+    return makeStreamingDownload("s3://" + bucket + "/" + object);
+}
+
 struct StreamingUploadSource {
 
-    StreamingUploadSource(const S3Api * owner,
-                          const std::string & bucket,
-                          const std::string & object,
+    StreamingUploadSource(const std::string & urlStr,
+                          const ML::OnUriHandlerException & excCallback,
                           const S3Api::ObjectMetadata & metadata)
     {
         impl.reset(new Impl());
-        impl->owner = owner;
-        impl->bucket = bucket;
-        impl->object = object;
+        impl->owner = getS3ApiForUri(urlStr);
+        std::tie(impl->bucket, impl->object) = S3Api::parseUri(urlStr);
         impl->metadata = metadata;
+        impl->onException = excCallback;
         impl->chunkSize = 8 * 1024 * 1024;  // start with 8MB and ramp up
 
         impl->start();
@@ -1946,7 +1971,7 @@ struct StreamingUploadSource {
 
     struct Impl {
         Impl()
-            : owner(0), offset(0), chunkIndex(0), shutdown(false),
+            : offset(0), chunkIndex(0), shutdown(false),
               chunks(16)
         {
         }
@@ -1957,7 +1982,7 @@ struct StreamingUploadSource {
             stop();
         }
 
-        const S3Api * owner;
+        shared_ptr<S3Api> owner;
         std::string bucket;
         std::string object;
         S3Api::ObjectMetadata metadata;
@@ -2043,17 +2068,27 @@ struct StreamingUploadSource {
         std::mutex etagsLock;
         std::vector<std::string> etags;
         std::exception_ptr exc;
+        ML::OnUriHandlerException onException;
 
         void start()
         {
-            auto upload = owner->obtainMultiPartUpload(bucket, "/" + object, metadata,
-                                                       S3Api::UR_EXCLUSIVE);
+            S3Api::MultiPartUpload upload;
+            try {
+                upload = owner->obtainMultiPartUpload(bucket, "/" + object,
+                                                      metadata,
+                                                      S3Api::UR_EXCLUSIVE);
+            }
+            catch (...) {
+                onException();
+                throw;
+            }
 
             uploadId = upload.id;
-            //cerr << "uploadId = " << uploadId << endl;
+            //cerr << "uploadId = " << uploadId << " with " << metadata.numThreads 
+            //<< "threads!!! " << endl;
 
             startDate = Date::now();
-            for (unsigned i = 0;  i < 8;  ++i)
+            for (unsigned i = 0;  i < metadata.numThreads;  ++i)
                 tg.create_thread(boost::bind<void>(&Impl::runThread, this));
             current.init(0, chunkSize, 0);
         }
@@ -2121,9 +2156,16 @@ struct StreamingUploadSource {
             if (exc)
                 std::rethrow_exception(exc);
 
-            string etag = owner->finishMultiPartUpload(bucket, "/" + object,
-                                                       uploadId,
-                                                       etags);
+            string etag;
+            try {
+                etag = owner->finishMultiPartUpload(bucket, "/" + object,
+                                                    uploadId,
+                                                    etags);
+            }
+            catch (...) {
+                onException();
+                throw;
+            }
             //cerr << "final etag is " << etag << endl;
 
             if (exc)
@@ -2175,6 +2217,7 @@ struct StreamingUploadSource {
                     } catch (...) {
                         // Capture exception to be thrown later
                         exc = std::current_exception();
+                        onException();
                     }
                 }
             }
@@ -2200,27 +2243,26 @@ struct StreamingUploadSource {
     }
 };
 
-std::auto_ptr<std::streambuf>
-S3Api::
-streamingUpload(const std::string & uri,
-                const ObjectMetadata & metadata) const
+std::unique_ptr<std::streambuf>
+makeStreamingUpload(const std::string & uri,
+                    const ML::OnUriHandlerException & onException,
+                    const S3Api::ObjectMetadata & metadata)
 {
-    string bucket, object;
-    std::tie(bucket, object) = parseUri(uri);
-    return streamingUpload(bucket, object, metadata);
-}
-
-std::auto_ptr<std::streambuf>
-S3Api::
-streamingUpload(const std::string & bucket,
-                const std::string & object,
-                const ObjectMetadata & metadata) const
-{
-    std::auto_ptr<std::streambuf> result;
+    std::unique_ptr<std::streambuf> result;
     result.reset(new boost::iostreams::stream_buffer<StreamingUploadSource>
-                 (StreamingUploadSource(this, bucket, object, metadata),
+                 (StreamingUploadSource(uri, onException, metadata),
                   131072));
     return result;
+}
+
+std::unique_ptr<std::streambuf>
+makeStreamingUpload(const std::string & bucket,
+                    const std::string & object,
+                    const ML::OnUriHandlerException & onException,
+                    const S3Api::ObjectMetadata & metadata)
+{
+    return makeStreamingUpload("s3://" + bucket + "/" + object,
+                               onException, metadata);
 }
 
 std::pair<std::string, std::string>
@@ -2237,21 +2279,6 @@ parseUri(const std::string & uri)
     string object(pathPart, pos + 1);
 
     return make_pair(bucket, object);
-}
-
-std::auto_ptr<std::streambuf>
-S3Api::
-streamingDownload(const std::string & uri,
-                  ssize_t startOffset,
-                  ssize_t endOffset,
-                  const OnChunk & onChunk) const
-{
-    string bucket, object;
-    std::tie(bucket, object) = parseUri(uri);
-
-    //cerr << "bucket = " << bucket << " object = " << object << endl;
-
-    return streamingDownload(bucket, object, startOffset, endOffset, onChunk);
 }
 
 void
@@ -2337,7 +2364,7 @@ forEachBucket(const OnBucket & onBucket) const
 
     //cerr << "forEachObject under " << prefix << endl;
 
-    auto listingResult = get("", "/", 8192, "");
+    auto listingResult = get("", "/", Range::Full, "");
     auto listingResultXml = listingResult.bodyXml();
 
     //listingResultXml->Print();
@@ -2455,8 +2482,13 @@ void registerS3Bucket(const std::string & bucketName,
     info.api = std::make_shared<S3Api>(accessKeyId, accessKey,
                                        bandwidthToServiceMbps,
                                        protocol, serviceUri);
-    info.api->getEscaped("", "/" + bucketName + "/", 8192);//throws if !accessible
+    info.api->getEscaped("", "/" + bucketName + "/",
+                         S3Api::Range::Full); //throws if !accessible
     s3Buckets[bucketName] = info;
+
+    if (accessKeyId.size() > 0 && accessKey.size() > 0) {
+        registerAwsCredentials(accessKeyId, accessKey);
+    }
 }
 
 /** Register S3 with the filter streams API so that a filter_stream can be used to
@@ -2467,7 +2499,8 @@ struct RegisterS3Handler {
     getS3Handler(const std::string & scheme,
                  const std::string & resource,
                  std::ios_base::open_mode mode,
-                 const std::map<std::string, std::string> & options)
+                 const std::map<std::string, std::string> & options,
+                 const ML::OnUriHandlerException & onException)
     {
         string::size_type pos = resource.find('/');
         if (pos == string::npos)
@@ -2475,11 +2508,8 @@ struct RegisterS3Handler {
                                 + resource);
         string bucket(resource, 0, pos);
 
-        std::shared_ptr<S3Api> api = getS3ApiForBucket(bucket);
-        ExcAssert(api);
-
         if (mode == ios::in) {
-            return make_pair(api->streamingDownload("s3://" + resource)
+            return make_pair(makeStreamingDownload("s3://" + resource)
                              .release(),
                              true);
         }
@@ -2514,13 +2544,18 @@ struct RegisterS3Handler {
                     throw ML::Exception("unknown aws option " + name + "=" + value
                                         + " opening S3 object " + resource);
                 }
+                else if(name == "num-threads")
+                {
+                    md.numThreads = std::stoi(value);
+                }
                 else {
                     cerr << "warning: skipping unknown S3 option "
                          << name << "=" << value << endl;
                 }
             }
 
-            return make_pair(api->streamingUpload("s3://" + resource, md)
+            return make_pair(makeStreamingUpload("s3://" + resource,
+                                                 onException, md)
                              .release(),
                              true);
         }
@@ -2748,7 +2783,24 @@ std::shared_ptr<S3Api> getS3ApiForBucket(const std::string & bucketName)
 
 std::shared_ptr<S3Api> getS3ApiForUri(const std::string & uri)
 {
-    return getS3ApiForBucket(S3Api::parseUri(uri).first);
+    Url url(uri);
+
+    string bucketName = url.host();
+    string accessKeyId = url.username();
+    if (accessKeyId.empty()) {
+        return getS3ApiForBucket(bucketName);
+    }
+
+    string accessKey = url.password();
+    if (accessKey.empty()) {
+        accessKey = getAwsAccessKey(accessKeyId);
+    }
+
+    auto api = make_shared<S3Api>(accessKeyId, accessKey);
+    api->getEscaped("", "/" + bucketName + "/",
+                    S3Api::Range::Full); //throws if !accessible
+
+    return api;
 }
 
 

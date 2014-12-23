@@ -8,19 +8,29 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 #include <map>
+#include "tinyxml2/tinyxml2.h"
 #include "jml/arch/exception.h"
 #include "jml/utils/unnamed_bool.h"
-#include "tinyxml2/tinyxml2.h"
-#include "soa/service/http_endpoint.h"
-#include "http_rest_proxy.h"
-#include <memory>
+#include "jml/utils/filter_streams.h"
 #include "aws.h"
 #include "fs_utils.h"
+#include "http_endpoint.h"
+#include "http_rest_proxy.h"
+
+#include "soa/types/basic_value_descriptions.h"
+#include "soa/types/value_description.h"
 
 namespace Datacratic {
+
+struct S3Config {
+    std::string accessKeyId;
+    std::string accessKey;
+};
+CREATE_STRUCTURE_DESCRIPTION(S3Config);
 
 
 /*****************************************************************************/
@@ -117,17 +127,26 @@ struct S3Api : public AwsApi {
             : offset(aOffset), size(aSize)
         {}
 
-        uint64_t endPos()
+        static Range Full;
+
+        uint64_t endPos() const
         { return (offset + size - 1); }
 
         void adjust(size_t downloaded)
         {
             if (downloaded > size) {
-                throw ML::Exception("excessive adjustment size");
+                throw ML::Exception("excessive adjustment size: downloaded %d size %d",
+                                     downloaded, size);
             }
             offset += downloaded;
             size -= downloaded;
         }
+
+        bool operator == (const Range & other) const
+        { return offset == other.offset && size == other.size; }
+
+        bool operator != (const Range & other) const
+        { return !(*this == other); }
 
         uint64_t offset;
         uint64_t size;
@@ -226,13 +245,15 @@ struct S3Api : public AwsApi {
     struct ObjectMetadata {
         ObjectMetadata()
             : redundancy(REDUNDANCY_DEFAULT),
-              serverSideEncryption(SSE_NONE)
+              serverSideEncryption(SSE_NONE),
+              numThreads(8)
         {
         }
 
         ObjectMetadata(const Redundancy & redundancy)
             : redundancy(redundancy),
-              serverSideEncryption(SSE_NONE)
+              serverSideEncryption(SSE_NONE),
+              numThreads(8)
         {
         }
 
@@ -245,6 +266,7 @@ struct S3Api : public AwsApi {
         std::string contentEncoding;
         std::map<std::string, std::string> metadata;
         std::string acl;
+        unsigned int numThreads;
     };
 
     /** Signed request that can be executed. */
@@ -392,40 +414,6 @@ struct S3Api : public AwsApi {
     void downloadToFile(const std::string & uri,
                   const std::string & outfile,
                   ssize_t endOffset = -1) const;
-
-    struct StreamingDownloadStreambuf;
-
-    /** Get a streambuf that will allow a bucket to be streamed through.  If
-        an onChunk is provided, downloaded chunks will also be provided
-        to that method.
-    */
-    std::auto_ptr<std::streambuf>
-    streamingDownload(const std::string & bucket,
-                      const std::string & object,
-                      ssize_t startOffset = 0,
-                      ssize_t endOffset = -1,
-                      const OnChunk & onChunk = OnChunk()) const;
-
-    /** Get a streambuf that will allow a bucket to be streamed through.  If
-        an onChunk is provided, downloaded chunks will also be provided
-        to that method.
-    */
-    std::auto_ptr<std::streambuf>
-    streamingDownload(const std::string & uri,
-                      ssize_t startOffset = 0,
-                      ssize_t endOffset = -1,
-                      const OnChunk & onChunk = OnChunk()) const;
-
-    /** Get a streambuf that will write to s3 when written to. */
-    std::auto_ptr<std::streambuf>
-    streamingUpload(const std::string & uri,
-                    const ObjectMetadata & md = ObjectMetadata()) const;
-
-    /** Get a streambuf that will write to s3 when written to. */
-    std::auto_ptr<std::streambuf>
-    streamingUpload(const std::string & bucket,
-                    const std::string & object,
-                    const ObjectMetadata & md = ObjectMetadata()) const;
 
     struct ObjectInfo : public FsObjectInfo {
         ObjectInfo()
@@ -665,7 +653,6 @@ void registerS3Bucket(const std::string & bucketName,
                       double bandwidthToServiceMbps = S3Api::defaultBandwidthToServiceMbps,
                       const std::string & protocol = "http",
                       const std::string & serviceUri = "s3.amazonaws.com");
-
 
 /** S3 support for filter_ostream opens.  Register the bucket name here, and
     you can open it directly from s3.  Queries and iterates over all

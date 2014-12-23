@@ -1,4 +1,4 @@
-/* agents_bidder_interface.h
+/* agents_bidder_interface.h                                       -*- C++ -*-
    Eric Robert, 2 April 2014
    Copyright (c) 2011 Datacratic.  All rights reserved.
 */
@@ -13,46 +13,59 @@ namespace RTBKIT {
 
 struct AgentsBidderInterface : public BidderInterface
 {
-    AgentsBidderInterface(std::string const & name = "bidder",
+    AgentsBidderInterface(std::string const & serviceName = "bidderService",
                           std::shared_ptr<ServiceProxies> proxies = std::make_shared<ServiceProxies>(),
                           Json::Value const & config = Json::Value());
+
+    ~AgentsBidderInterface();
 
     void sendAuctionMessage(std::shared_ptr<Auction> const & auction,
                             double timeLeftMs,
                             std::map<std::string, BidInfo> const & bidders);
 
-    void sendWinLossMessage(MatchedWinLoss const & event);
+    void sendWinLossMessage(const std::shared_ptr<const AgentConfig>& agentConfig,
+                            MatchedWinLoss const & event);
 
-    void sendLossMessage(std::string const & agent,
+    void sendLossMessage(const std::shared_ptr<const AgentConfig>& agentConfig,
+                         std::string const & agent,
                          std::string const & id);
 
-    void sendCampaignEventMessage(std::string const & agent,
+    void sendCampaignEventMessage(const std::shared_ptr<const AgentConfig>& agentConfig,
+                                  std::string const & agent,
                                   MatchedCampaignEvent const & event);
 
-    void sendBidLostMessage(std::string const & agent,
+    void sendBidLostMessage(const std::shared_ptr<const AgentConfig>& agentConfig,
+                            std::string const & agent,
                             std::shared_ptr<Auction> const & auction);
 
-    void sendBidDroppedMessage(std::string const & agent,
+    void sendBidDroppedMessage(const std::shared_ptr<const AgentConfig>& agentConfig,
+                               std::string const & agent,
                                std::shared_ptr<Auction> const & auction);
 
-    void sendBidInvalidMessage(std::string const & agent,
+    void sendBidInvalidMessage(const std::shared_ptr<const AgentConfig>& agentConfig,
+                               std::string const & agent,
                                std::string const & reason,
                                std::shared_ptr<Auction> const & auction);
 
-    void sendNoBudgetMessage(std::string const & agent,
+    void sendNoBudgetMessage(const std::shared_ptr<const AgentConfig>& agentConfig,
+                             std::string const & agent,
                              std::shared_ptr<Auction> const & auction);
 
-    void sendTooLateMessage(std::string const & agent,
+    void sendTooLateMessage(const std::shared_ptr<const AgentConfig>& agentConfig,
+                            std::string const & agent,
                             std::shared_ptr<Auction> const & auction);
 
-    void sendMessage(std::string const & agent,
+    void sendMessage(const std::shared_ptr<const AgentConfig>& agentConfig,
+                     std::string const & agent,
                      std::string const & message);
 
-    void sendErrorMessage(std::string const & agent,
+    void sendErrorMessage(const std::shared_ptr<const AgentConfig>& agentConfig,
+                          std::string const & agent,
                           std::string const & error,
                           std::vector<std::string> const & payload);
 
-    void sendPingMessage(std::string const & agent,
+    void sendPingMessage(const std::shared_ptr<const AgentConfig>& agentConfig,
+                         std::string const & agent,
                          int ping);
 
 };

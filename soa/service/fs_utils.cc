@@ -16,6 +16,7 @@
 #include "googleurl/src/url_util.h"
 
 #include "fs_utils.h"
+#include "jml/utils/guard.h"
 #include "jml/utils/file_functions.h"
 
 #include <sys/types.h>
@@ -70,6 +71,9 @@ struct LocalUrlFsHandler : public UrlFsHandler {
         // cerr << "fs info on path: " + path + "\n";
         int res = ::stat(path.c_str(), &stats);
         if (res == -1) {
+            if (errno == ENOENT) {
+                return FsObjectInfo();
+            }
             throw ML::Exception(errno, "stat");
         }
 
@@ -78,6 +82,20 @@ struct LocalUrlFsHandler : public UrlFsHandler {
         return extractInfo(stats);
     }
 
+    virtual FsObjectInfo tryGetInfo(const Url & url) const
+    {
+        struct stat stats;
+        string path = url.path();
+
+        // cerr << "fs info on path: " + path + "\n";
+        int res = ::stat(path.c_str(), &stats);
+        if (res == -1) {
+            return FsObjectInfo();
+        }
+
+        return extractInfo(stats);
+    }
+    
     virtual void makeDirectory(const Url & url) const
     {
         boost::system::error_code ec;
@@ -171,6 +189,9 @@ struct AtInit {
 /* ensures that local filenames are represented as urls */
 Url makeUrl(const string & urlStr)
 {
+    if (urlStr.empty())
+        throw ML::Exception("can't makeUrl on empty url");
+
     /* scheme is specified */
     if (urlStr.find("://") != string::npos) {
         return Url(urlStr);
@@ -229,24 +250,19 @@ void registerUrlFsHandler(const std::string & scheme,
 }
 
 FsObjectInfo
+tryGetUriObjectInfo(const std::string & url)
+{
+    Url realUrl = makeUrl(url);
+    return findFsHandler(realUrl.scheme())->tryGetInfo(realUrl);
+}
+
+FsObjectInfo
 getUriObjectInfo(const std::string & url)
 {
     Url realUrl = makeUrl(url);
     return findFsHandler(realUrl.scheme())->getInfo(realUrl);
 }
-
-FsObjectInfo
-tryGetUriObjectInfo(const std::string & url)
-{
-    JML_TRACE_EXCEPTIONS(false);
-    try {
-        return getUriObjectInfo(url);
-    }
-    catch (...) {
-        return FsObjectInfo();
-    }
-}
-
+ 
 size_t
 getUriSize(const std::string & url)
 {
@@ -267,7 +283,7 @@ makeUriDirectory(const std::string & url)
     string dirUrl(url);
     size_t slashIdx = dirUrl.rfind('/');
     if (slashIdx == string::npos) {
-        throw ML::Exception("makeUriDirectory cannot work on filenames");
+        throw ML::Exception("makeUriDirectory cannot work on filenames: instead of " + url + " you should probably write file://" + url);
     }
     dirUrl.resize(slashIdx);
 
@@ -305,9 +321,11 @@ string
 baseName(const std::string & filename)
 {
     char *fnCopy = ::strdup(filename.c_str());
+    ML::Call_Guard guard([&] {
+        ::free(fnCopy);
+    });
     char *dirNameC = ::basename(fnCopy);
     string dirname(dirNameC);
-    ::free(fnCopy);
 
     return dirname;
 }
@@ -316,9 +334,11 @@ string
 dirName(const std::string & filename)
 {
     char *fnCopy = ::strdup(filename.c_str());
+    ML::Call_Guard guard([&] {
+        ::free(fnCopy);
+    });
     char *dirNameC = ::dirname(fnCopy);
     string dirname(dirNameC);
-    ::free(fnCopy);
 
     return dirname;
 }
