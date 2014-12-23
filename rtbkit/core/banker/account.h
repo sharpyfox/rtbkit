@@ -68,7 +68,7 @@ extern const std::string AccountTypeToString(enum AccountType type);
 
 struct Account {
     Account()
-        : type(AT_NONE)
+        : type(AT_NONE), status(ACTIVE)
     {
     }
 
@@ -99,6 +99,9 @@ struct Account {
     LineItems adjustmentLineItems;  ///< Adjustment line items
 
     // Invariant: sum(Credit Side) = sum(Debit Side)
+
+    enum Status {CLOSED, ACTIVE};
+    Status status;
 
 public:
     bool isSameOrPastVersion(const Account & otherAccount) const
@@ -141,7 +144,16 @@ public:
         result["adjustmentsOut"] = adjustmentsOut.toJson();
         result["lineItems"] = lineItems.toJson();
         result["adjustmentLineItems"] = adjustmentLineItems.toJson();
-
+        switch (status) {
+        case ACTIVE:
+            result["status"] = "active";
+            break;
+        case CLOSED:
+            result["status"] = "closed";
+            break; 
+        default: 
+            result["status"] = "active";
+        }
         return result;
     }
 
@@ -162,6 +174,19 @@ public:
             result.budgetDecreases = CurrencyPool::fromJson(json["budgetDecreases"]);
             result.adjustmentsOut = CurrencyPool::fromJson(json["adjustmentsOut"]);
         }
+        
+        if (json.isMember("status")) {
+            std::string s = json["status"].asString();
+            if (s == "active") 
+                result.status = ACTIVE;
+            else if (s == "closed")
+                result.status = CLOSED;
+            else
+                result.status = ACTIVE;
+        } else {
+            result.status = ACTIVE;
+        }
+
         result.spent = CurrencyPool::fromJson(json["spent"]);
         result.recycledIn = CurrencyPool::fromJson(json["recycledIn"]);
         result.recycledOut = CurrencyPool::fromJson(json["recycledOut"]);
@@ -174,6 +199,7 @@ public:
         result.adjustmentsIn = CurrencyPool::fromJson(json["adjustmentsIn"]);
         result.lineItems = LineItems::fromJson(json["lineItems"]);
         result.adjustmentLineItems = LineItems::fromJson(json["adjustmentLineItems"]);
+
         result.balance = ((result.budgetIncreases
                              + result.recycledIn
                              + result.commitmentsRetired
@@ -191,7 +217,7 @@ public:
 
         return result;
     }
-
+    
     /*************************************************************************/
     /* DERIVED QUANTITIES                                                    */
     /*************************************************************************/
@@ -414,8 +440,10 @@ public:
 
 struct ShadowAccount {
     ShadowAccount()
-        : attachedBids(0), detachedBids(0)
+        : status(Account::ACTIVE), attachedBids(0), detachedBids(0)
         {}
+
+    Account::Status status;
 
     // credit
     CurrencyPool netBudget;          ///< net of fields not mentioned here
@@ -643,6 +671,7 @@ struct ShadowAccount {
         balance = netBudget + commitmentsRetired
             - commitmentsMade - spent;
 
+        status = masterAccount.status;
         checkInvariants();
     }
 
@@ -843,6 +872,18 @@ struct Accounts {
         newAccount.balance = validAccount.balance;
         newAccount.lineItems = validAccount.lineItems;
         newAccount.adjustmentLineItems = validAccount.adjustmentLineItems;
+        newAccount.status = Account::ACTIVE;
+    }
+
+    void reactivateAccount(const AccountKey & accountKey)
+    {
+        Guard guard(lock);
+        AccountKey parents = accountKey;
+        while (!parents.empty()) {
+            getAccountImpl(parents).status = Account::ACTIVE;
+            parents.pop_back();
+        }
+        reactivateAccountChildren(accountKey);
     }
 
     const Account createBudgetAccount(const AccountKey & account)
@@ -865,6 +906,22 @@ struct Accounts {
     {
         Guard guard(lock);
         return getAccountImpl(account);
+    }
+
+    std::pair<bool, bool> accountPresentAndActive(const AccountKey & account) const
+    {
+        Guard guard(lock);
+        return accountPresentAndActiveImpl(account);
+    }
+    
+    /** closeAccount behavior is to close all children then close itself,
+        always transfering from children to parent. If top most account, 
+        then throws an error after closing all children first.
+    */
+    const Account closeAccount(const AccountKey & account)
+    {
+        Guard guard(lock);
+        return closeAccountImpl(account);
     }
 
     void checkInvariants() const
@@ -961,6 +1018,7 @@ struct Accounts {
 
         return a;
     }
+
 
 
     /*************************************************************************/
@@ -1194,15 +1252,55 @@ private:
     {
         auto it = accounts.find(account);
         if (it == accounts.end())
-            throw ML::Exception("couldn't get account");
+            throw ML::Exception("couldn't get account: " + account.toString());
         return it->second;
+    }
+
+    std::pair<bool, bool> accountPresentAndActiveImpl(const AccountKey & account) const
+    {
+        auto it = accounts.find(account);
+        if (it == accounts.end())
+            return std::make_pair(false, false);
+        if (it->second.status == Account::CLOSED)
+            return std::make_pair(true, false);
+        else
+            return std::make_pair(true, true);
+    }
+
+
+    const Account closeAccountImpl(const AccountKey & accountKey)
+    {
+        AccountInfo & account = getAccountImpl(accountKey);
+        if (account.status == Account::CLOSED)
+            return account;
+
+        for ( AccountKey child : account.children ) {
+            closeAccountImpl(child);
+        }
+
+        if (accountKey.size() > 1)
+            account.recuperateTo(getParentAccount(accountKey));
+
+        account.status = Account::CLOSED;
+
+        return account;
+    }
+
+    void reactivateAccountChildren(const AccountKey & accountKey) {
+        if (accountPresentAndActiveImpl(accountKey).first) {
+            AccountInfo & account = getAccountImpl(accountKey);
+            for (auto child : account.children)
+                reactivateAccountChildren(child);
+
+            account.status = Account::ACTIVE;
+        }
     }
 
     const AccountInfo & getAccountImpl(const AccountKey & account) const
     {
         auto it = accounts.find(account);
         if (it == accounts.end())
-            throw ML::Exception("couldn't get account");
+            throw ML::Exception("couldn't get account: " + account.toString());
         return it->second;
     }
 
@@ -1381,6 +1479,22 @@ struct ShadowAccounts {
         return !getAccountImpl(accountKey).uninitialized;
     }
 
+    bool isStalled(const AccountKey & accountKey) const
+    {
+        Guard guard(lock);
+        auto & account = getAccountImpl(accountKey);
+        return account.uninitialized && account.requested.minutesUntil(Date::now()) >= 1.0;
+    }
+
+    void reinitializeStalledAccount(const AccountKey & accountKey)
+    {
+        ExcAssert(isStalled(accountKey));
+        Guard guard(lock);
+        auto & account = getAccountImpl(accountKey);
+        account.first = true;
+        account.requested = Date::now();
+    }
+
     /*************************************************************************/
     /* BID OPERATIONS                                                        */
     /*************************************************************************/
@@ -1450,7 +1564,7 @@ private:
 
     struct AccountEntry : public ShadowAccount {
         AccountEntry(bool uninitialized = true, bool first = true)
-            : uninitialized(uninitialized), first(first)
+            : requested(Date::now()), uninitialized(uninitialized), first(first)
         {
         }
 
@@ -1464,6 +1578,8 @@ private:
             slave banker can both have different ideas of the state of the
             budget of an account.
         */
+
+        Date requested;
         bool uninitialized;
         bool first;
     };
@@ -1527,13 +1643,13 @@ public:
     }
 
     void
-    forEachInitializedAccount(const std::function<void (const AccountKey &,
+    forEachInitializedAndActiveAccount(const std::function<void (const AccountKey &,
                                                         const ShadowAccount &)> & onAccount)
     {
         Guard guard(lock);
         
         for (auto & a: accounts) {
-            if (a.second.uninitialized)
+            if (a.second.uninitialized || a.second.status == Account::CLOSED)
                 continue;
             onAccount(a.first, a.second);
         }

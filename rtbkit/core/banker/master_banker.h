@@ -35,6 +35,11 @@ inline std::string restEncode(const AccountKey & val)
     return val.toString();
 }
 
+namespace Default {
+    static constexpr int RedisTimeout = 10;
+    static constexpr double SaveInterval = 10.0;
+}
+
 
 /*****************************************************************************/
 /* REAL BANKER                                                               */
@@ -145,28 +150,55 @@ inline std::string restEncode(const AccountKey & val)
 struct BankerPersistence {
     enum PersistenceCallbackStatus {
         SUCCESS,             /* info = "" */
-        BACKEND_ERROR,       /* info = error string */
+        PERSISTENCE_ERROR,       /* info = error string */
         DATA_INCONSISTENCY   /* info = json array of account keys */
+    };
+
+    typedef std::map<std::string, uint64_t> LatencyMap;
+
+    struct Result {
+        PersistenceCallbackStatus status;
+        LatencyMap latencies;
+
+        Result() { }
+        Result(PersistenceCallbackStatus cbStatus) : status(cbStatus) { }
+
+        void recordLatency(const std::string &key, uint64_t latency) {
+            latencies.insert(std::make_pair(key, latency));
+        }
     };
 
     virtual ~BankerPersistence()
     {
     }
 
+
+    static Logging::Category print;
+    static Logging::Category trace;
+    static Logging::Category error;
+    static Logging::Category debug;
+
     /* callback types */
     typedef std::function<void (std::shared_ptr<Accounts>,
                                 PersistenceCallbackStatus,
                                 const std::string & info)>
         OnLoadedCallback;
-    typedef std::function<void (PersistenceCallbackStatus,
+    typedef std::function<void (const Result& result,
                                 const std::string & info)>
         OnSavedCallback;
+    
+    typedef std::function<void (std::shared_ptr<Accounts>,
+                                PersistenceCallbackStatus,
+                                const std::string & info)>
+        OnRestoredCallback;
 
     /* backend methods */
     virtual void loadAll(const std::string & topLevelKey,
                          OnLoadedCallback onLoaded) = 0;
     virtual void saveAll(const Accounts & toSave,
                          OnSavedCallback onDone) = 0;
+    virtual void restoreFromArchive(const AccountKey & accountName,
+                         OnRestoredCallback onRestored) = 0;
 };
 
 
@@ -192,7 +224,14 @@ struct NoBankerPersistence : public BankerPersistence {
     virtual void
     saveAll(const Accounts & toSave, OnSavedCallback onDone)
     {
-        onDone(SUCCESS, "");
+        onDone(Result { SUCCESS }, "");
+    }
+
+    virtual void
+    restoreFromArchive(const AccountKey & key,
+                       OnRestoredCallback onRestored)
+    {
+        onRestored(std::make_shared<Accounts>(), SUCCESS, "");
     }
 };
 
@@ -201,14 +240,21 @@ struct NoBankerPersistence : public BankerPersistence {
 /*****************************************************************************/
 
 struct RedisBankerPersistence : public BankerPersistence {
-    RedisBankerPersistence(const Redis::Address & redis);
-    RedisBankerPersistence(std::shared_ptr<Redis::AsyncConnection> redis);
+    RedisBankerPersistence(
+            const Redis::Address & redis, int timeout = Default::RedisTimeout);
+    RedisBankerPersistence(
+            std::shared_ptr<Redis::AsyncConnection> redis, int timeout = Default::RedisTimeout);
 
     struct Itl;
     std::shared_ptr<Itl> itl;
+    static const std::string PREFIX;
 
     void loadAll(const std::string & topLevelKey, OnLoadedCallback onLoaded);
     void saveAll(const Accounts & toSave, OnSavedCallback onDone);
+    void restoreFromArchive(const AccountKey & key, OnRestoredCallback onRestored);
+private:
+    void moveToActive(const std::vector<AccountKey> & archivedAccountKeys,
+                                OnRestoredCallback onRestored);
 };
 
 /*****************************************************************************/
@@ -237,8 +283,7 @@ struct OldRedisBankerPersistence : public BankerPersistence {
 
 struct MasterBanker
     : public ServiceBase,
-      public RestServiceEndpoint,
-      public MonitorProvider
+      public RestServiceEndpoint
 {
 
     MasterBanker(std::shared_ptr<ServiceProxies> proxies,
@@ -247,7 +292,8 @@ struct MasterBanker
 
     std::shared_ptr<BankerPersistence> storage_;
 
-    void init(const std::shared_ptr<BankerPersistence> & storage);
+    void init(const std::shared_ptr<BankerPersistence> & storage,
+              double saveInterval = Default::SaveInterval);
     void start();
     std::pair<std::string, std::string> bindTcp();
 
@@ -264,7 +310,10 @@ struct MasterBanker
 
     RestRequestRouter router;
     Accounts accounts;
+
     Date lastSavedState;
+    BankerPersistence::LatencyMap lastSaveLatency;
+    std::string lastSaveInfo;
     BankerPersistence::PersistenceCallbackStatus lastSaveStatus;
 
     typedef ML::Spinlock Lock;
@@ -284,20 +333,40 @@ struct MasterBanker
     void loadStateSync();
 
     void onStateLoaded(std::shared_ptr<Accounts> newAccounts,
-                       BankerPersistence::PersistenceCallbackStatus status,
+                       const BankerPersistence::Result& result,
                        const std::string & info);
-    void onStateSaved(BankerPersistence::PersistenceCallbackStatus status,
+    void onStateSaved(const BankerPersistence::Result& result,
                       const std::string & info);
-
-    /* Reponds to Monitor requests */
-    MonitorProviderClient monitorProviderClient;
-
-    /* MonitorProvider interface */
-    std::string getProviderClass() const;
-    MonitorIndicator getProviderIndicators() const;
+    void onAccountRestored(std::shared_ptr<Accounts> restoredAccounts,
+                           const BankerPersistence::Result& result,
+                           const std::string & info);
 
     Date lastWin;
     Date lastImpression;
+
+    static Logging::Category print;
+    static Logging::Category trace;
+    static Logging::Category error;
+    static Logging::Category debug;
+
+private:
+    const Account onCreateAccount(const AccountKey &account, AccountType type);
+    const Account setBudget(const AccountKey &key, const CurrencyPool &newBudget);
+    const Account setBalance(const AccountKey &key, CurrencyPool amount, AccountType type);
+    std::map<std::string, Account> setBalanceBatched(const Json::Value &transfers);
+    const Account addAdjustment(const AccountKey &key, CurrencyPool amount);
+    const Account syncFromShadow(const AccountKey &key, const ShadowAccount &shadow);
+    std::map<std::string, Account> syncFromShadowBatched(const Json::Value &transfers);
+
+    void reportLatencies(const std::string& category,
+                         const BankerPersistence::LatencyMap& latencies) const;
+
+    bool closeAccount(const AccountKey &key);
+    const std::vector<AccountKey> getActiveAccounts();
+    void restoreAccount(const AccountKey & key);
+    void reactivatePresentAccounts(const AccountKey & key);
+
+    void checkPersistence();
 };
 
 } // namespace RTBKIT

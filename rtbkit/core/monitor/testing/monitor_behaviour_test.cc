@@ -58,14 +58,16 @@ BOOST_AUTO_TEST_CASE( test_monitor_endpoint )
     MockMonitorProvider provider1("c1");
     provider1.providerName_ = "parentservice1";
     ServiceBase parentService1("parentservice1", proxies);
-    MonitorProviderClient providerClient1(proxies->zmqContext, provider1);
+    MonitorProviderClient providerClient1(proxies->zmqContext);
+    providerClient1.addProvider(&provider1);
     providerClient1.init(proxies->config);
     providerClient1.start();
 
     MockMonitorProvider provider2("c2");
     provider2.providerName_ = "parentservice2";
     ServiceBase parentService2("parentservice2", proxies);
-    MonitorProviderClient providerClient2(proxies->zmqContext, provider2);
+    MonitorProviderClient providerClient2(proxies->zmqContext);
+    providerClient2.addProvider(&provider2);
     providerClient2.init(proxies->config);
     providerClient2.start();
 
@@ -143,7 +145,7 @@ BOOST_AUTO_TEST_CASE( test_monitor_client )
 
     cerr << "test: expect computed status to be TRUE"
          << " after quering the Monitor" << endl;
-    client.lastStatus = false;
+    client.lastSuccess = Date::now().addSeconds(-10.0);
     endpoint.providersStatus_["c1"]["tim"].lastCheck = Date::now();
     endpoint.providersStatus_["c1"]["tim"].lastStatus = true;
     Date initialCheck = client.lastCheck;
@@ -156,7 +158,7 @@ BOOST_AUTO_TEST_CASE( test_monitor_client )
 
     cerr << "test: expect computed status to be FALSE"
          << " after quering the Monitor" << endl;
-    client.lastStatus = true;
+    client.lastSuccess = Date::now();
     endpoint.providersStatus_["c1"]["tim"].lastStatus = false;
     initialCheck = client.lastCheck;
     while (client.lastCheck == initialCheck) {

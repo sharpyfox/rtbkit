@@ -25,11 +25,17 @@ struct PostAuctionRunner {
     PostAuctionRunner();     
 
     ServiceProxyArguments serviceArgs;
+    SlaveBankerArguments bankerArgs;
 
-    size_t shards;
+    size_t shard;
     float auctionTimeout;
     float winTimeout;
     std::string bidderConfigurationFile;
+
+    int winLossPipeTimeout;
+    int campaignEventPipeTimeout;
+    bool analyticsOn;
+    int analyticsConnections;
 
     void doOptions(int argc, char ** argv,
                    const boost::program_options::options_description & opts
@@ -44,6 +50,10 @@ struct PostAuctionRunner {
     void start();
 
     void shutdown();
+
+    static Logging::Category print;
+    static Logging::Category trace;
+    static Logging::Category error;
 
 };
 

@@ -19,6 +19,9 @@ using namespace ML;
 
 namespace Datacratic {
 
+// Maximum number of events that we can handle
+static constexpr int MaxEvents = 1024;
+
 
 /*****************************************************************************/
 /* EPOLLER                                                                   */
@@ -93,7 +96,7 @@ handleEvents(int usToWait, int nEvents,
              const OnEvent & afterSleep_)
 {
     if (nEvents == -1) {
-        nEvents = numFds_;
+        nEvents = std::max<int>(numFds_, 1);
     }
 
     const HandleEvent & handleEvent
@@ -102,6 +105,12 @@ handleEvents(int usToWait, int nEvents,
         = beforeSleep_ ? beforeSleep_ : this->beforeSleep;
     const OnEvent & afterSleep
         = afterSleep_ ? afterSleep_ : this->afterSleep;
+
+    if (nEvents <= 0)
+        throw ML::Exception("can't wait for no events");
+
+    if (nEvents > MaxEvents)
+        nEvents = MaxEvents;
 
     for (;;) {
         epoll_event events[nEvents];
@@ -115,8 +124,10 @@ handleEvents(int usToWait, int nEvents,
             pollfd fd[1] = { { epoll_fd, POLLIN, 0 } };
             timespec timeout = { 0, usToWait * 1000 };
             int res = ppoll(fd, 1, &timeout, 0);
-            if (res == -1 && errno == EBADF)
+            if (res == -1 && errno == EBADF) {
+                cerr << "got bad FD on sleep" << endl;
                 return -1;
+            }
             if (res == -1 && errno == EINTR)
                 continue;
             //if (debug) cerr << "handleEvents: res = " << res << endl;
@@ -135,13 +146,17 @@ handleEvents(int usToWait, int nEvents,
             return -1;
         }
         if (res == 0) return 0;
-
-        if (res == -1)
+        
+        if (res == -1) {
+            //cerr << "epoll_fd = " << epoll_fd << endl;
+            //cerr << "timeout_ = " << timeout_ << endl;
+            //cerr << "nEvents = " << nEvents << endl;
             throw Exception(errno, "epoll_wait");
+        }
         nEvents = res;
-
+        
         for (unsigned i = 0;  i < nEvents;  ++i) {
-            if (handleEvent(events[i])) return -1;
+            if (handleEvent(events[i]) == SHUTDOWN) return -1;
         }
                 
         return nEvents;
@@ -155,12 +170,16 @@ poll() const
     for (;;) {
         pollfd fds[1] = { { epoll_fd, POLLIN, 0 } };
         int res = ::poll(fds, 1, 0);
+
+        //cerr << "poll res = " << res << endl;
+
         if (res == -1 && errno == EBADF)
             return false;
         if (res == -1 && errno == EINTR)
             continue;
         if (res == -1)
             throw ML::Exception("ppoll in Epoller::poll");
+
         return res > 0;
     }
 }
@@ -194,6 +213,16 @@ performAddFd(int fd, void * data, bool oneshot, bool restart)
         throw ML::Exception("epoll_ctl: %s (fd=%d, epollfd=%d, oneshot=%d,"
                             " restart=%d)",
                             strerror(errno), fd, epoll_fd, oneshot, restart);
+}
+
+bool
+Epoller::
+processOne()
+{
+    int res = handleEvents();
+    //cerr << "processOne res = " << res << endl;
+    if (res == -1) return false;  // wakeup for shutdown
+    return poll();
 }
 
 } // namespace Datacratic

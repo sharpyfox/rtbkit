@@ -61,6 +61,12 @@ setBudget(const CurrencyPool & newBudget)
     cerr << "balance: " << balance
          << "; extraBudget: " << extraBudget << endl;
 #endif
+    auto preview = balance + extraBudget;
+
+    if(!preview.isNonNegative()) {
+        extraBudget = CurrencyPool() - balance;
+    }
+
     ExcAssert((balance + extraBudget).isNonNegative());
 
     if (extraBudget.isNonNegative()) {
@@ -70,6 +76,8 @@ setBudget(const CurrencyPool & newBudget)
         budgetDecreases -= extraBudget;
     }
     balance += extraBudget;
+   
+    status = ACTIVE;
 
     checkInvariants();
 }

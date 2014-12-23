@@ -107,7 +107,7 @@ spinup(int num_threads, bool synchronous)
 
     threadsActive_ = 0;
 
-    totalSleepTime.resize(num_threads, 0.0);
+    totalSleepTime.resize(num_threads, 1.0);
 
     for (unsigned i = 0;  i < num_threads;  ++i) {
         boost::thread * thread
@@ -406,8 +406,7 @@ numConnectionsByHost() const
     return numTransportsByHost;
 }
 
-/** Handle a single ePoll event */
-bool
+Epoller::HandleEventResult
 EndpointBase::
 handleEpollEvent(epoll_event & event)
 {
@@ -446,13 +445,13 @@ handleEpollEvent(epoll_event & event)
     }
     case EpollData::EpollDataType::WAKEUP:
         // wakeup for shutdown
-        return true;
+        return Epoller::SHUTDOWN;
     default:
         throw ML::Exception("unrecognized fd type");
     }
 
 
-    return false;
+    return Epoller::DONE;
 }
 
 void

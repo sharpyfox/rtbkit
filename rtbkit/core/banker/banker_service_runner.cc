@@ -38,17 +38,36 @@ int main(int argc, char ** argv)
 
     std::string redisUri;  ///< TODO: zookeeper
 
+    std::string redisPassword;
+
+    int redisDatabase = 0;
+
+    int redisTimeout = 0;
+    int saveInterval = 0;
+
+    bool debug = false;
+
     std::vector<std::string> fixedHttpBindAddresses;
 
     configuration_options.add_options()
         ("redis-uri,r", value<string>(&redisUri)->required(),
          "URI of connection to redis")
+        ("redis-password,p", value<string>(&redisPassword),
+         "Password of connection to redis")
+        ("redis-database,d", value<int>(&redisDatabase),
+         "Database of connection to redis")
+        ("redis-save-timeout", value<int>(&redisTimeout)->default_value(10),
+         "Delay at which redis calls will timeout")
+        ("save-interval", value<int>(&saveInterval)->default_value(10),
+         "Periodic delay at which state will be saved")
         ("fixed-http-bind-address,a", value(&fixedHttpBindAddresses),
-         "Fixed address (host:port or *:port) at which we will always listen");
+         "Fixed address (host:port or *:port) at which we will always listen")
+        ("debug", bool_switch(&debug),
+         "Debug mode enabled");
 
     options_description all_opt;
     all_opt
-        .add(serviceArgs.makeProgramOptions())
+        .add(serviceArgs.makeProgramOptions("General Options"))
         .add(configuration_options);
     all_opt.add_options()
         ("help,h", "print this message");
@@ -72,18 +91,30 @@ int main(int argc, char ** argv)
     MasterBanker banker(proxies, serviceName);
     std::shared_ptr<Redis::AsyncConnection> redis;
 
+    if (debug)
+        banker.debug.activate();
+
     if (redisUri != "nopersistence") {
+        std::cout << " redisUri=" << redisUri << std::endl;
         auto address = Redis::Address(redisUri);
         redis = std::make_shared<Redis::AsyncConnection>(redisUri);
+        if(redisPassword != "")
+            redis->auth(redisPassword);
+        if(redisDatabase != 0)
+            redis->select(redisDatabase);
         redis->test();
-
-        banker.init(std::make_shared<RedisBankerPersistence>(redisUri));
+        auto persistence = std::make_shared<RedisBankerPersistence>(redis, redisTimeout);
+        if (debug)
+            persistence->debug.activate();
+        banker.init(
+                persistence,
+                saveInterval);
     }
     else {
         cerr << "*** WARNING ***" << endl;
         cerr << "BANKER IS RUNNING WITH NO PERSISTENCE" << endl;
         cerr << "IF THIS IS NOT A TESTING ENVIRONEMNT, SPEND WILL BE LOST" << endl;
-        banker.init(std::make_shared<NoBankerPersistence>());
+        banker.init(std::make_shared<NoBankerPersistence>(), saveInterval);
     }
 
     // Bind to any fixed addresses

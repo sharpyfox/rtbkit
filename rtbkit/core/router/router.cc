@@ -6,6 +6,7 @@
 */
 
 #include <set>
+#include <atomic>
 #include "router.h"
 #include "soa/service/zmq_utils.h"
 #include "jml/arch/backtrace.h"
@@ -113,14 +114,18 @@ Router(ServiceBase & parent,
        bool connectPostAuctionLoop,
        bool logAuctions,
        bool logBids,
-       Amount maxBidAmount)
+       Amount maxBidAmount,
+       int secondsUntilSlowMode,
+       Amount slowModeAuthorizedMoneyLimit)
     : ServiceBase(serviceName, parent),
       shutdown_(false),
+      postAuctionEndpoint(parent.getServices()),
       configBuffer(1024),
       exchangeBuffer(64),
       startBiddingBuffer(65536),
       submittedBuffer(65536),
       auctionGraveyard(65536),
+      doBidBuffer(65536),
       augmentationLoop(*this),
       loopMonitor(*this),
       loadStabilizer(loopMonitor),
@@ -137,14 +142,19 @@ Router(ServiceBase & parent,
       logBids(logBids),
       logger(getZmqContext()),
       doDebug(false),
+      disableAuctionProb(false),
       numAuctions(0), numBids(0), numNonEmptyBids(0),
       numAuctionsWithBid(0), numNoPotentialBidders(0),
       numNoBidders(0),
-      monitorClient(getZmqContext()),
-      slowModeCount(0),
-      monitorProviderClient(getZmqContext(), *this),
-      maxBidAmount(maxBidAmount)
+      monitorClient(getZmqContext(), secondsUntilSlowMode),
+      slowModePeriodicSpentReached(false),
+      slowModeAuthorizedMoneyLimit(slowModeAuthorizedMoneyLimit),
+      accumulatedBidMoneyInThisPeriod(0),
+      monitorProviderClient(getZmqContext()),
+      maxBidAmount(maxBidAmount),
+      slowModeTolerance(MonitorClient::DefaultTolerance)
 {
+    monitorProviderClient.addProvider(this);
 }
 
 Router::
@@ -154,15 +164,18 @@ Router(std::shared_ptr<ServiceProxies> services,
        bool connectPostAuctionLoop,
        bool logAuctions,
        bool logBids,
-       Amount maxBidAmount)
+       Amount maxBidAmount,
+       int secondsUntilSlowMode,
+       Amount slowModeAuthorizedMoneyLimit)
     : ServiceBase(serviceName, services),
       shutdown_(false),
-      postAuctionEndpoint(getZmqContext()),
+      postAuctionEndpoint(services),
       configBuffer(1024),
       exchangeBuffer(64),
       startBiddingBuffer(65536),
       submittedBuffer(65536),
       auctionGraveyard(65536),
+      doBidBuffer(65536),
       augmentationLoop(*this),
       loopMonitor(*this),
       loadStabilizer(loopMonitor),
@@ -179,14 +192,19 @@ Router(std::shared_ptr<ServiceProxies> services,
       logBids(logBids),
       logger(getZmqContext()),
       doDebug(false),
+      disableAuctionProb(false),
       numAuctions(0), numBids(0), numNonEmptyBids(0),
       numAuctionsWithBid(0), numNoPotentialBidders(0),
       numNoBidders(0),
-      monitorClient(getZmqContext()),
-      slowModeCount(0),
-      monitorProviderClient(getZmqContext(), *this),
-      maxBidAmount(maxBidAmount)
+      monitorClient(getZmqContext(), secondsUntilSlowMode),
+      slowModePeriodicSpentReached(false),
+      slowModeAuthorizedMoneyLimit(slowModeAuthorizedMoneyLimit),
+      accumulatedBidMoneyInThisPeriod(0),
+      monitorProviderClient(getZmqContext()),
+      maxBidAmount(maxBidAmount),
+      slowModeTolerance(MonitorClient::DefaultTolerance)
 {
+    monitorProviderClient.addProvider(this);
 }
 
 void
@@ -195,6 +213,14 @@ initBidderInterface(Json::Value const & json)
 {
     bidder = BidderInterface::create(serviceName() + ".bidder", getServices(), json);
     bidder->init(&bridge, this);
+    bidder->registerLoopMonitor(&loopMonitor);
+}
+
+void
+Router::
+initAnalytics(const string & baseUrl, const int numConnections)
+{
+    analytics.init(baseUrl, numConnections);
 }
 
 void
@@ -233,12 +259,9 @@ init()
             cerr << "agent " << agent << " disconnected from router" << endl;
         };
 
-    postAuctionEndpoint.init(getServices()->config, ZMQ_XREQ);
-
     configListener.onConfigChange = [=] (const std::string & agent,
                                          std::shared_ptr<const AgentConfig> config)
         {
-            cerr << endl << endl << "agent " << agent << " got new configuration" << endl;
             configBuffer.push(make_pair(agent, config));
         };
 
@@ -258,10 +281,15 @@ init()
     loopMonitor.addMessageLoop("configListener", &configListener);
     loopMonitor.addMessageLoop("monitorClient", &monitorClient);
     loopMonitor.addMessageLoop("monitorProviderClient", &monitorProviderClient);
+    if (analytics.initialized) loopMonitor.addMessageLoop("analytics", &analytics);
 
     loopMonitor.onLoadChange = [=] (double)
         {
-            double keepProb = 1.0 - loadStabilizer.shedProbability();
+            double keepProb = 1.0;
+
+            if(!disableAuctionProb) {
+                keepProb -= loadStabilizer.shedProbability();
+            }
 
             setAcceptAuctionProbability(keepProb);
             recordEvent("auctionKeepPercentage", ET_LEVEL, keepProb * 100.0);
@@ -288,6 +316,7 @@ Router::
 setBanker(const std::shared_ptr<Banker> & newBanker)
 {
     banker = newBanker;
+    monitorProviderClient.addProvider(banker.get());
 }
 
 void
@@ -329,7 +358,14 @@ unsafeDisableMonitor()
     // TODO: we shouldn't be reaching inside these structures...
     monitorClient.testMode = true;
     monitorClient.testResponse = true;
-    monitorProviderClient.inhibit_ = true;
+    monitorProviderClient.disable();
+}
+
+void
+Router::
+unsafeDisableAuctionProbability()
+{
+    disableAuctionProb = true;
 }
 
 void
@@ -352,11 +388,12 @@ start(boost::function<void ()> onStop)
 
     bidder->start();
     logger.start();
+    analytics.start();
     augmentationLoop.start();
     runThread.reset(new boost::thread(runfn));
 
     if (connectPostAuctionLoop) {
-        postAuctionEndpoint.connectToServiceClass("rtbPostAuctionService", "events");
+        postAuctionEndpoint.init();
     }
 
     configListener.init(getServices()->config);
@@ -483,6 +520,9 @@ run()
     };
 
     std::map<std::string, TimesEntry> times;
+    auto recordTime = [&] (std::string name, double start) {
+        times[std::move(name)].add(microsecondsBetween(getTime(), start));
+    };
 
 
     // Attempt to wake up once per millisecond
@@ -491,44 +531,54 @@ run()
 
     while (!shutdown_) {
         beforeSleep = getTime();
-
         totalActive += beforeSleep - afterSleep;
-        dutyCycleCurrent.nsProcessing
-            += microsecondsBetween(beforeSleep, afterSleep);
+        dutyCycleCurrent.nsProcessing += microsecondsBetween(beforeSleep, afterSleep);
 
         int rc = 0;
 
-        for (unsigned i = 0;  i < 20 && rc == 0;  ++i)
-            rc = zmq_poll(items, 2, 0);
-        if (rc == 0) {
-            ++numTimesCouldSleep;
-            checkExpiredAuctions();
+        {
+            double atStart = getTime();
 
-#if 1
-            // Try to sleep only once per 1/2 a millisecond to avoid too many
-            // context switches.
-            Date now = Date::now();
-            double timeSinceSleep = lastSleep.secondsUntil(now);
-            double timeToWait = 0.0005 - timeSinceSleep;
-            if (timeToWait > 0) {
-                ML::sleep(timeToWait);
-            }
-            lastSleep = now;
-#endif
+            for (unsigned i = 0;  i < 20 && rc == 0;  ++i)
+                rc = zmq_poll(items, 2, 0);
 
-
-            rc = zmq_poll(items, 2, 50 /* milliseconds */);
+            recordTime("spinPoll", atStart);
         }
 
-        //cerr << "rc = " << rc << endl;
+        if (rc == 0) {
+            ++numTimesCouldSleep;
+
+            {
+                double atStart = getTime();
+                checkExpiredAuctions();
+                recordTime("checkExpiredAuctions", atStart);
+            }
+
+            {
+                double atStart = getTime();
+
+                // Try to sleep only once per 1/2 a millisecond to avoid too
+                // many context switches.
+                Date now = Date::now();
+                double timeSinceSleep = lastSleep.secondsUntil(now);
+                double timeToWait = 0.0005 - timeSinceSleep;
+                if (timeToWait > 0) {
+                    ML::sleep(timeToWait);
+                }
+                lastSleep = now;
+
+                recordTime("sleep", atStart);
+            }
+
+            double pollStart = getTime();
+            rc = zmq_poll(items, 2, 50 /* milliseconds */);
+            recordTime("sleepPoll", pollStart);
+        }
 
         afterSleep = getTime();
 
-        dutyCycleCurrent.nsSleeping
-            += microsecondsBetween(afterSleep, beforeSleep);
+        dutyCycleCurrent.nsSleeping += microsecondsBetween(afterSleep, beforeSleep);
         dutyCycleCurrent.nEvents += 1;
-
-        times["asleep"].add(microsecondsBetween(afterSleep, beforeSleep));
 
         if (rc == -1 && zmq_errno() != EINTR) {
             cerr << "zeromq error: " << zmq_strerror(zmq_errno()) << endl;
@@ -541,11 +591,23 @@ run()
                 doStartBidding(info);
             }
 
-            double atEnd = getTime();
-            times["doStartBidding"].add(microsecondsBetween(atEnd, atStart));
+            recordTime("doStartBidding", atStart);
         }
 
         {
+            double atStart = getTime();
+
+            BidMessage message;
+            while (doBidBuffer.tryPop(message)) {
+                doBidImpl(message);
+            }
+
+            recordTime("doBid", atStart);
+        }
+
+        {
+            double atStart = getTime();
+
             std::shared_ptr<ExchangeConnector> exchange;
             while (exchangeBuffer.tryPop(exchange)) {
                 for (auto & agent : agents) {
@@ -554,6 +616,8 @@ run()
                                              *agent.second.config);
                 };
             }
+
+            recordTime("configureAgentOnExchange", atStart);
         }
 
         {
@@ -562,67 +626,65 @@ run()
             std::pair<std::string, std::shared_ptr<const AgentConfig> > config;
             while (configBuffer.tryPop(config)) {
                 if (!config.second) {
-                    // deconfiguration
-                    // TODO
-                    cerr << "agent " << config.first << " lost configuration"
-                         << endl;
+                    cerr << "agent " << config.first << " lost configuration" << endl;
                 }
                 else {
                     doConfig(config.first, config.second);
                 }
             }
 
-            double atEnd = getTime();
-            times["doConfig"].add(microsecondsBetween(atEnd, atStart));
+            recordTime("doConfig", atStart);
         }
 
         {
             double atStart = getTime();
+
             std::shared_ptr<Auction> auction;
             while (submittedBuffer.tryPop(auction))
                 doSubmitted(auction);
 
-            double atEnd = getTime();
-            times["doSubmitted"].add(microsecondsBetween(atEnd, atStart));
+            recordTime("doSubmitted", atStart);
         }
 
         if (items[0].revents & ZMQ_POLLIN) {
-            double beforeMessage = getTime();
+            double atStart = getTime();
             // Agent message
             vector<string> message;
             try {
                 message = recvAll(bridge.agents.getSocketUnsafe());
                 bridge.agents.handleMessage(std::move(message));
-                double atEnd = getTime();
-                times[message.at(1)].add(microsecondsBetween(atEnd, beforeMessage));
+
             } catch (const std::exception & exc) {
                 cerr << "error handling agent message " << message
                      << ": " << exc.what() << endl;
                 logRouterError("handleAgentMessage", exc.what(),
                                message);
             }
+
+            recordTime(message.at(1), atStart);
         }
 
         if (items[1].revents & ZMQ_POLLIN) {
             wakeupMainLoop.read();
         }
 
-        //checkExpiredAuctions();
-
         double now = ML::wall_time();
-        double beforeChecks = getTime();
 
         if (now - lastPings > 1.0) {
+            double atStart = getTime();
+
             // Send out pings and interpret the results of the last lot of
             // pinging.
             sendPings();
-
             lastPings = now;
+
+            recordTime("sendPings", atStart);
         }
 
+        double beforeChecks = getTime();
+
         if (now - last_check_pace > 10.0) {
-            recordEvent("numTimesCouldSleep", ET_LEVEL,
-                        numTimesCouldSleep);
+            recordEvent("numTimesCouldSleep", ET_LEVEL, numTimesCouldSleep);
 
             totalSleeps += numTimesCouldSleep;
 
@@ -677,12 +739,16 @@ run()
             last_check = now;
         }
 
-        times["checks"].add(microsecondsBetween(getTime(), beforeChecks));
+        recordTime("checks", beforeChecks);
 
         if (now - lastTimestamp >= 1.0) {
+            double atStart = getTime();
+
             banker->logBidEvents(*this);
             //issueTimestamp();
             lastTimestamp = now;
+
+            recordTime("logBidEvents", atStart);
         }
     }
 
@@ -811,7 +877,7 @@ handleAgentMessage(const std::vector<std::string> & message)
             string configName = message.at(2);
             if (!agents.count(configName)) {
                 // We don't yet know about its configuration
-                bidder->sendMessage(address, "NEEDCONFIG");
+                bidder->sendMessage(nullptr, address, "NEEDCONFIG");
                 return;
             }
             agents[configName].address = address;
@@ -894,6 +960,15 @@ logUsageMetrics(double period)
                    delta.auctions,
                    delta.bids,
                    info.config->bidProbability);
+        logMessageToAnalytics("USAGE", "AGENT", p, item.first,
+                   info.config->account.toString(),
+                   delta.intoFilters,
+                   delta.passedStaticFilters,
+                   delta.passedDynamicFilters,
+                   delta.auctions,
+                   delta.bids,
+                   info.config->bidProbability);
+
 
         last = move(newMetrics);
     }
@@ -922,6 +997,14 @@ logUsageMetrics(double period)
                    delta.numBids,
                    delta.numAuctionsWithBid,
                    acceptAuctionProbability / numExchanges);
+        logMessageToAnalytics("USAGE", "ROUTER", p,
+                   delta.numRequests,
+                   delta.numAuctions,
+                   delta.numNoPotentialBidders,
+                   delta.numBids,
+                   delta.numAuctionsWithBid,
+                   acceptAuctionProbability / numExchanges);
+
 
         lastRouterUsageMetrics = move(newMetrics);
     }
@@ -963,7 +1046,7 @@ checkDeadAgents()
 
                     this->recordHit("accounts.%s.lostBids", account);
 
-                    bidder->sendBidLostMessage(it->first, inFlight[id].auction);
+                    bidder->sendBidLostMessage(info.config, it->first, inFlight[id].auction);
 
                     toExpire.push_back(id);
                 }
@@ -1013,7 +1096,7 @@ checkDeadAgents()
                 // agent is dead
                 cerr << "agent " << it->first << " appears to be dead"
                      << endl;
-                bidder->sendMessage(it->first, "BYEBYE");
+                bidder->sendMessage(info.config, it->first, "BYEBYE");
                 deadAgents.push_back(it);
             }
         }
@@ -1067,7 +1150,7 @@ checkExpiredAuctions()
                         this->recordHit("accounts.%s.droppedBids",
                                         info.config->account.toString('.'));
 
-                        bidder->sendBidDroppedMessage(agent, auctionInfo.auction);
+                        bidder->sendBidDroppedMessage(info.config, agent, auctionInfo.auction);
                     }
                 }
 
@@ -1120,7 +1203,47 @@ returnErrorResponse(const std::vector<std::string> & message,
     using namespace std;
     if (message.empty()) return;
     logMessage("ERROR", error, message);
-    bidder->sendErrorMessage(message[0], error, message);
+    logMessageToAnalytics("ERROR", error, message);
+    const auto& agent = message[0];
+    AgentInfo & info = this->agents[agent];
+    bidder->sendErrorMessage(info.config, agent, error, message);
+}
+
+void
+Router::
+returnInvalidBid(
+        const std::string &agent, const std::string &bidData,
+        const std::shared_ptr<Auction> &auction,
+        const char *reason, const char *message, ...) {
+
+    auto& agentInfo = agents[agent];
+    const auto& agentConfig = agentInfo.config;
+    this->recordHit("bidErrors.%s", reason);
+    this->recordHit("accounts.%s.bidErrors.total",
+                    agentConfig->account.toString('.'));
+    this->recordHit("accounts.%s.bidErrors.%s",
+                    agentConfig->account.toString('.'),
+                    reason);
+
+    ++agentInfo.stats->invalid;
+
+    va_list ap;
+    va_start(ap, message);
+    string formatted;
+    try {
+        formatted = vformat(message, ap);
+    } catch (...) {
+        va_end(ap);
+        throw;
+    }
+    va_end(ap);
+
+    cerr << "invalid bid for agent " << agent << ": "
+         << formatted << endl;
+    cerr << bidData << endl;
+
+    logMessageToAnalytics("INVALID", agentConfig, agent, formatted, auction);
+    bidder->sendBidInvalidMessage(agentConfig, agent, formatted, auction);
 }
 
 void
@@ -1247,8 +1370,6 @@ preprocessAuction(const std::shared_ptr<Auction> & auction)
 
     bool traceAuction = auction->id.hash() % 10 == 0;
 
-    AgentConfig::RequestFilterCache cache(*auction->request);
-
     auto exchangeConnector = auction->exchangeConnector;
 
 
@@ -1341,6 +1462,8 @@ preprocessAuction(const std::shared_ptr<Auction> & auction)
         // request
         validGroups.push_back(it->second);
     }
+
+    this->recordLevel(validGroups.size(), "potentialBiddersPerRequest");
 
     if (validGroups.empty()) {
         // Now we need to end the auction
@@ -1618,6 +1741,8 @@ doStartBidding(const std::shared_ptr<AugmentationInfo> & augInfo)
             // Unwind everything?
         }
 
+        this->recordLevel(auctionInfo.bidders.size(), "bidRequestsSentToBiddersPerRequest");
+
         if (!auctionInfo.bidders.empty()) {
             bidder->sendAuctionMessage(
                     auctionInfo.auction, timeLeftMs, auctionInfo.bidders);
@@ -1676,60 +1801,10 @@ void
 Router::
 doBid(const std::vector<std::string> & message)
 {
-    //static const char *fName = "Router::doBid:";
-    if (failBid(bidsErrorRate)) {
-        returnErrorResponse(message, "Intentional error response (--bids-error-rate)");
-        return;
-    }
-
-    Date dateGotBid = Date::now();
-
-    RouterProfiler profiler(dutyCycleCurrent.nsBid);
-
-    ML::atomic_inc(numBids);
-
     if (message.size() < 5 || message.size() > 6) {
         returnErrorResponse(message, "BID message has 4-5 parts");
         return;
     }
-
-    static std::map<const char *, unsigned long long> times;
-
-    static Date lastPrinted = Date::now();
-
-    if (lastPrinted.secondsUntil(dateGotBid) > 10.0) {
-#if 0
-        unsigned long long total = 0;
-        for (auto it = times.begin(), end = times.end(); it != end;  ++it)
-            total += it->second;
-
-        cerr << "doBid of " << total << " microseconds" << endl;
-        cerr << "id = " << message[2] << endl;
-        for (auto it = times.begin(), end = times.end();
-             it != end;  ++it) {
-            cerr << ML::format("%-30s %8lld %6.2f%%\n",
-                               it->first,
-                               it->second,
-                               100.0 * it->second / total);
-        }
-#endif
-        lastPrinted = dateGotBid;
-        times.clear();
-    }
-
-    double current = getProfilingTime();
-
-    auto doProfileEvent = [&] (int i, const char * what)
-        {
-            return;
-            double after = getProfilingTime();
-            times[what] += microsecondsBetween(after, current);
-            current = after;
-        };
-
-    recordHit("bid");
-
-    doProfileEvent(0, "start");
 
     Id auctionId(message[2]);
 
@@ -1742,107 +1817,106 @@ doBid(const std::vector<std::string> & message)
     static const string nullStr("null");
     const string & meta = (message.size() >= 6 ? message[5] : nullStr);
 
-    doProfileEvent(1, "params");
-
-    debugAuction(auctionId, "BID", message);
-
-    if (!agents.count(agent)) {
-        returnErrorResponse(message, "unknown agent");
-        return;
-    }
-
-    doProfileEvent(2, "agents");
-
-    AgentInfo & info = agents[agent];
-
-    /* One less in flight. */
-    if (!info.expireBidInFlight(auctionId)) {
-        recordHit("bidError.agentNotBidding");
-        returnErrorResponse(message, "agent wasn't bidding on this auction");
-        return;
-    }
-
-    doProfileEvent(3, "inFlight");
-
-    auto it = inFlight.find(auctionId);
-    if (it == inFlight.end()) {
-        recordHit("bidError.unknownAuction");
-        returnErrorResponse(message, "unknown auction");
-        return;
-    }
-
-    doProfileEvent(4, "account");
-
-    AuctionInfo & auctionInfo = it->second;
-
-    auto biddersIt = auctionInfo.bidders.find(agent);
-    if (biddersIt == auctionInfo.bidders.end()) {
-        recordHit("bidError.agentSkippedAuction");
-        returnErrorResponse(message,
-                            "agent shouldn't bid on this auction");
-        return;
-    }
-
-    auto & config = *biddersIt->second.agentConfig;
-
-    recordHit("accounts.%s.bids", config.account.toString('.'));
-
-    doProfileEvent(5, "auctionInfo");
-
-    //cerr << "info.inFlight = " << info.inFlight << endl;
-
-    const std::vector<AdSpot> & imp = auctionInfo.auction->request->imp;
-
-    int numValidBids = 0;
-
-    auto returnInvalidBid = [&] (int i, const char * reason,
-                                 const char * message, ...)
-        {
-            this->recordHit("bidErrors.%s", reason);
-            this->recordHit("accounts.%s.bidErrors.total",
-                            config.account.toString('.'));
-            this->recordHit("accounts.%s.bidErrors.%s",
-                            config.account.toString('.'),
-                            reason);
-
-            ++info.stats->invalid;
-
-            va_list ap;
-            va_start(ap, message);
-            string formatted;
-            try {
-                formatted = vformat(message, ap);
-            } catch (...) {
-                va_end(ap);
-                throw;
-            }
-            va_end(ap);
-
-            cerr << "invalid bid for agent " << agent << ": "
-                 << formatted << endl;
-            cerr << biddata << endl;
-
-            bidder->sendBidInvalidMessage(agent, formatted, auctionInfo.auction);
-        };
-
-    BidInfo bidInfo(std::move(biddersIt->second));
-    auctionInfo.bidders.erase(biddersIt);
-
-    doProfileEvent(6, "bidInfo");
-
-    int numPassedBids = 0;
+    BidMessage bidMessage;
+    bidMessage.agents.push_back(agent);
+    bidMessage.auctionId = auctionId;
+    bidMessage.wcm = std::move(wcm);
+    bidMessage.meta = std::move(meta);
 
     Bids bids;
     try {
         bids = Bids::fromJson(biddata);
     }
     catch (const std::exception & exc) {
-        returnInvalidBid(-1, "bidParseError",
-                "couldn't parse bid JSON %s: %s", biddata.c_str(), exc.what());
+        auto it = inFlight.find(auctionId);
+        if (it == inFlight.end()) {
+            recordHit("bidError.unknownAuction");
+            returnErrorResponse(message, "unknown auction");
+            return;
+        }
+        else {
+            returnInvalidBid(agent, biddata, it->second.auction,
+                    "bidParseError",
+                    "couldn't parse bid JSON %s: %s", biddata.c_str(), exc.what());
+        }
+        return;
+    }
+    bidMessage.bids = std::move(bids);
+
+    doBidImpl(bidMessage, message);
+}
+
+void
+Router::
+doBidImpl(const BidMessage &message, const std::vector<std::string> &originalMessage)
+{
+    Date dateGotBid = Date::now();
+
+    if (failBid(bidsErrorRate)) {
+        returnErrorResponse(originalMessage, "Intentional error response (--bids-error-rate)");
         return;
     }
 
-    doProfileEvent(6, "parsing");
+    ExcAssert(!message.agents.empty());
+
+    const auto& auctionId = message.auctionId;
+    auto it = inFlight.find(auctionId);
+    if (it == inFlight.end()) {
+        recordHit("bidError.unknownAuction");
+        returnErrorResponse(originalMessage, "unknown auction");
+        return;
+    }
+
+    AuctionInfo & auctionInfo = it->second;
+
+    for (const auto &agent: message.agents) {
+        if (!agents.count(agent)) {
+            returnErrorResponse(originalMessage, "unknown agent");
+            return;
+        }
+
+        auto biddersIt = auctionInfo.bidders.find(agent);
+        if (biddersIt == auctionInfo.bidders.end()) {
+            recordHit("bidError.agentSkippedAuction");
+            returnErrorResponse(originalMessage,
+                                "agent shouldn't bid on this auction");
+            return;
+        }
+
+        AgentInfo & info = agents[agent];
+        /* One less in flight. */
+        if (!info.expireBidInFlight(auctionId)) {
+            recordHit("bidError.agentNotBidding");
+            returnErrorResponse(originalMessage, "agent wasn't bidding on this auction");
+            return;
+        }
+        auto & config = *biddersIt->second.agentConfig;
+        recordHit("accounts.%s.bids", config.account.toString('.'));
+    }
+
+
+    const std::vector<AdSpot> & imp = auctionInfo.auction->request->imp;
+
+    int numValidBids = 0;
+
+    recordHit("bid");
+
+    const auto& agent = message.agents[0];
+    auto biddersIt = auctionInfo.bidders.find(agent);
+    auto & config = *biddersIt->second.agentConfig;
+    AgentInfo & info = agents[agent];
+    const auto& agentConfig = info.config;
+
+    const auto& bids = message.bids;
+    auto bidsString = bids.toJson().toStringNoNewLine();
+
+    BidInfo bidInfo(std::move(biddersIt->second));
+
+    RouterProfiler profiler(dutyCycleCurrent.nsBid);
+
+    ML::atomic_inc(numBids);
+
+    int numPassedBids = 0;
 
     ExcCheckEqual(bids.size(), bidInfo.imp.size(),
             "invalid shape for bids array");
@@ -1851,7 +1925,7 @@ doBid(const std::vector<std::string> & message)
 
     for (int i = 0; i < bids.size(); ++i) {
 
-        const Bid& bid = bids[i];
+        Bid bid = bids[i];
 
         if (bid.isNullBid()) {
             ++numPassedBids;
@@ -1861,30 +1935,37 @@ doBid(const std::vector<std::string> & message)
         int spotIndex = bidInfo.imp[i].first;
 
         if (bid.creativeIndex == -1) {
-            returnInvalidBid(i, "nullCreativeField",
+            returnInvalidBid(agent, bidsString, auctionInfo.auction,
+                    "nullCreativeField",
                     "creative field is null in response %s",
-                    biddata.c_str());
+                    bidsString.c_str());
             continue;
         }
 
         if (bid.creativeIndex < 0
                 || bid.creativeIndex >= config.creatives.size())
         {
-            returnInvalidBid(i, "outOfRangeCreative",
+            returnInvalidBid(agent, bidsString, auctionInfo.auction,
+                    "outOfRangeCreative",
                     "parsing field 'creative' of %s: creative "
                     "number %d out of range 0-%zd",
-                    biddata.c_str(), bid.creativeIndex,
+                    bidsString.c_str(), bid.creativeIndex,
                     config.creatives.size());
             continue;
         }
 
         if (bid.price.isNegative() || bid.price > maxBidAmount) {
-            returnInvalidBid(i, "invalidPrice",
+            if (slowModePeriodicSpentReached) {
+                bid.price = maxBidAmount;
+            } else {
+                returnInvalidBid(agent, bidsString, auctionInfo.auction,
+                    "invalidPrice",
                     "bid price of %s is outside range of $0-%s parsing bid %s",
                     bid.price.toString().c_str(),
                     maxBidAmount.toString().c_str(),
-                    biddata.c_str());
-            continue;
+                    bidsString.c_str());
+                continue;
+            }
         }
 
         const Creative & creative = config.creatives.at(bid.creativeIndex);
@@ -1895,14 +1976,15 @@ doBid(const std::vector<std::string> & message)
             cerr << "auction: " << auctionInfo.auction->requestStr
                 << endl;
             cerr << "config: " << config.toJson() << endl;
-            cerr << "bid: " << biddata << endl;
+            cerr << "bid: " << bidsString << endl;
             cerr << "spot: " << imp[i].toJson() << endl;
             cerr << "spot num: " << spotIndex << endl;
             cerr << "bid num: " << i << endl;
             cerr << "creative num: " << bid.creativeIndex << endl;
             cerr << "creative: " << creative.toJson() << endl;
 #endif
-            returnInvalidBid(i, "creativeNotCompatibleWithSpot",
+            returnInvalidBid(agent, bidsString, auctionInfo.auction,
+                    "creativeNotCompatibleWithSpot",
                     "creative %s not compatible with spot %s",
                     creative.toJson().toString().c_str(),
                     imp[spotIndex].toJson().toString().c_str());
@@ -1911,12 +1993,11 @@ doBid(const std::vector<std::string> & message)
 
         if (!creative.biddable(auctionInfo.auction->request->exchange,
                         auctionInfo.auction->request->protocolVersion)) {
-            returnInvalidBid(i, "creativeNotBiddableOnExchange",
+            returnInvalidBid(agent, bidsString, auctionInfo.auction,
+                    "creativeNotBiddableOnExchange",
                     "creative not biddable on exchange/version");
             continue;
         }
-
-        doProfileEvent(6, "creativeCompatibility");
 
         string auctionKey
             = auctionId.toString() + "-"
@@ -1924,24 +2005,56 @@ doBid(const std::vector<std::string> & message)
             + agent;
 
         // authorize an amount of money computed from the win cost model.
-        Amount price = wcm.evaluate(bid, bid.price);
+        Amount price = message.wcm.evaluate(bid, bid.price);
+
+        if (!monitorClient.getStatus(slowModeTolerance)) {
+            Date now = Date::now();
+            if ((uint32_t) slowModeLastAuction.secondsSinceEpoch()
+                    < (uint32_t) now.secondsSinceEpoch()) {
+                slowModeLastAuction = now;
+                slowModePeriodicSpentReached = false;
+                // TODO Insure in router.cc (not router_runner) that
+                // maxBidPrice <= slowModeAuthorizedMoneyLimit
+                // Here we're garanteed that price.value >= slowModeAuthorizedMoneyLimit
+                accumulatedBidMoneyInThisPeriod = price.value;
+
+                recordHit("monitor.systemInSlowMode"); 
+            }
+
+            else {
+                accumulatedBidMoneyInThisPeriod += price.value;
+                // Check if we're spending more in this period than what slowModeAuthorizedMoneyLimit
+                // allows us to.
+                if (accumulatedBidMoneyInThisPeriod > slowModeAuthorizedMoneyLimit.value) {
+                    slowModePeriodicSpentReached = true;
+                    bidder->sendBidDroppedMessage(agentConfig, agent, auctionInfo.auction);
+                    recordHit("slowMode.droppedBid");
+                continue;
+                }
+            }
+        } else {
+            // Make sure slowModePeriodicSpentReached is false if monitor success is satisfied.
+            // There is a possible (90% sure..) code path where slowModePeriodicSpentReached is not resetted
+            slowModePeriodicSpentReached = false;
+        }
 
         if (!banker->authorizeBid(config.account, auctionKey, price)
                 || failBid(budgetErrorRate))
         {
             ++info.stats->noBudget;
 
-            bidder->sendNoBudgetMessage(agent, auctionInfo.auction);
+            bidder->sendNoBudgetMessage(agentConfig, agent, auctionInfo.auction);
 
             this->logMessage("NOBUDGET", agent, auctionId,
-                    biddata, meta);
+                    bidsString, message.meta);
+            this->logMessageToAnalytics("NOBUDGET", agent, auctionId,
+                    bidsString, message.meta);
             continue;
         }
+        
+        recordCount(bid.price.value, "cummulatedBidPrice");
+        recordCount(price.value, "cummulatedAuthorizedPrice");
 
-	recordCount(bid.price.value, "cummulatedBidPrice");
-	recordCount(price.value, "cummulatedAuthorizedPrice");
-
-        doProfileEvent(6, "banker");
 
         if (doDebug)
             this->debugSpot(auctionId, imp[spotIndex].id,
@@ -1950,26 +2063,24 @@ doBid(const std::vector<std::string> & message)
                             bid.price.toString().c_str(),
                             (double)bid.priority));
 
-        Auction::Price bidprice(bid.price, bid.priority);
         Auction::Response response(
-                bidprice,
+                Auction::Price(bid.price, bid.priority),
                 creative.id,
                 config.account,
                 config.test,
                 agent,
-                biddata,
-                meta,
+                bids,
+                message.meta,
                 info.config,
                 config.visitChannels,
                 bid.creativeIndex,
-                wcm);
+                message.wcm);
 
         response.creativeName = creative.name;
 
         Auction::WinLoss localResult
             = auctionInfo.auction->setResponse(spotIndex, response);
 
-        doProfileEvent(6, "bidSubmission");
         ++numValidBids;
 
         // Possible results:
@@ -2009,21 +2120,22 @@ doBid(const std::vector<std::string> & message)
             switch (localResult.val) {
             case Auction::WinLoss::LOSS:
                 status = BS_LOSS;
-                bidder->sendLossMessage(agent, auctionId.toString());
+                bidder->sendLossMessage(agentConfig, agent, auctionId.toString());
                 break;
             case Auction::WinLoss::TOOLATE:
                 status = BS_TOOLATE;
-                bidder->sendTooLateMessage(agent, auctionInfo.auction);
+                bidder->sendTooLateMessage(agentConfig, agent, auctionInfo.auction);
                 break;
             case Auction::WinLoss::INVALID:
                 status = BS_INVALID;
-                bidder->sendBidInvalidMessage(agent, msg, auctionInfo.auction);
+                bidder->sendBidInvalidMessage(agentConfig, agent, msg, auctionInfo.auction);
                 break;
             default:
                 throw ML::Exception("logic error");
             }
 
-            this->logMessage(msg, agent, auctionId, biddata, meta);
+            this->logMessage(msg, agent, auctionId, bidsString, message.meta);
+            this->logMessageToAnalytics(msg, agent, auctionId, bidsString, message.meta);
             continue;
         }
         case Auction::WinLoss::WIN:
@@ -2035,13 +2147,15 @@ doBid(const std::vector<std::string> & message)
                     "unknown bid result returned by auction");
         }
 
-        doProfileEvent(6, "bidResponse");
     }
+
+    this->recordCount(info.stats->bids, "bidsPerBidRequest");
 
     if (numValidBids > 0) {
         if (logBids)
             // Send BID to logger
-            logMessage("BID", agent, auctionId, biddata, meta);
+            logMessage("BID", agent, auctionId, bidsString, message.meta);
+        logMessageToAnalytics("BID", agent, auctionId, bidsString, message.meta);
         ML::atomic_add(numNonEmptyBids, 1);
     }
     else if (numPassedBids > 0) {
@@ -2050,10 +2164,11 @@ doBid(const std::vector<std::string> & message)
             const BidRequest & bidRequest = *auctionInfo.auction->request;
             blacklist.add(bidRequest, agent, *info.config);
         }
-        doProfileEvent(8, "blacklist");
     }
 
-    doProfileEvent(8, "postParsing");
+    for (const auto& agent: message.agents) {
+        auctionInfo.bidders.erase(agent);
+    }
 
     double bidTime = dateGotBid.secondsSince(bidInfo.bidTime);
 
@@ -2066,39 +2181,19 @@ doBid(const std::vector<std::string> & message)
                   "accounts.%s.bidResponseTimeMs",
                   config.account.toString('.'));
 
-    doProfileEvent(9, "postTiming");
 
     if (auctionInfo.bidders.empty()) {
-        debugAuction(auctionId, "FINISH", message);
+        debugAuction(auctionId, "FINISH", originalMessage);
         if (!auctionInfo.auction->finish()) {
-            debugAuction(auctionId, "FINISH TOO LATE", message);
+            debugAuction(auctionId, "FINISH TOO LATE", originalMessage);
         }
         inFlight.erase(auctionId);
         //cerr << "couldn't finish auction " << auctionInfo.auction->id
         //<< " after bid " << message << endl;
     }
 
-    doProfileEvent(10, "finishAuction");
-
-    // TODO: clean up if no bids were made?
-#if 0
-    // Bids must be the same shape as the bid info or empty
-    if (bidInfo.imp.size() != bids.size() && bids.size() != 0) {
-        ++info.stats->bidErrors;
-        returnInvalidBid(-1, "wrongBidResponseShape",
-                         "number of imp in bid request doesn't match "
-                         "those in bid: %d vs %d",
-                         bidInfo.imp.size(), bids.size(),
-                         bidInfo.imp.toJson().toString().c_str(),
-                         biddata.c_str());
-
-        if (auctionInfo.bidders.empty()) {
-            auctionInfo.auction->finish();
-            inFlight.erase(auctionId);
-        }
-    }
-#endif
 }
+
 
 void
 Router::
@@ -2168,6 +2263,7 @@ doSubmitted(std::shared_ptr<Auction> auction)
             if (!agents.count(response.agent)) continue;
 
             AgentInfo & info = agents[response.agent];
+            const auto& agentConfig = info.config;
 
             Amount bid_price = response.price.maxPrice;
 
@@ -2207,13 +2303,13 @@ doSubmitted(std::shared_ptr<Auction> auction)
                 bidStatus = BS_LOSS;
                 ++info.stats->losses;
                 msg = "LOSS";
-                bidder->sendLossMessage(response.agent, auctionId.toString());
+                bidder->sendLossMessage(agentConfig, response.agent, auctionId.toString());
                 break;
             case Auction::WinLoss::TOOLATE:
                 bidStatus = BS_TOOLATE;
                 ++info.stats->tooLate;
                 msg = "TOOLATE";
-                bidder->sendTooLateMessage(response.agent, auction);
+                bidder->sendTooLateMessage(agentConfig, response.agent, auction);
                 break;
             default:
                 throwException("doSubmitted.unknownStatus",
@@ -2229,7 +2325,7 @@ doSubmitted(std::shared_ptr<Auction> auction)
 
         // If we didn't actually submit a bid then nothing else to do
         if (!hasSubmittedBid) continue;
-
+        this->recordHit("numRequestWithBid");
         ML::atomic_add(numAuctionsWithBid, 1);
         //cerr << fName << "injecting submitted auction " << endl;
 
@@ -2271,21 +2367,13 @@ void
 Router::
 onNewAuction(std::shared_ptr<Auction> auction)
 {
-    if (!monitorClient.getStatus()) {
+    if (!monitorClient.getStatus(slowModeTolerance)) {
+        // check if slow mode active and in the same second then ignore the Auction
         Date now = Date::now();
-
-        if ((uint32_t) slowModeLastAuction.secondsSinceEpoch()
-            < (uint32_t) now.secondsSinceEpoch()) {
-            slowModeLastAuction = now;
-            slowModeCount = 1;
-            recordHit("monitor.systemInSlowMode");
-        }
-        else {
-            slowModeCount++;
-        }
-
-        if (slowModeCount > 100) {
-            /* we only let the first 100 auctions take place each second */
+        // TODO slowModeLastAuction is not atomic and a race condition could happen since it's
+        // used by router loop AND exchange connector threads
+        if (slowModePeriodicSpentReached && (uint32_t) slowModeLastAuction.secondsSinceEpoch()
+                == (uint32_t) now.secondsSinceEpoch() ) {
             recordHit("monitor.ignoredAuctions");
             auction->finish();
             return;
@@ -2297,6 +2385,7 @@ onNewAuction(std::shared_ptr<Auction> auction)
     if (logAuctions)
         // Send AUCTION to logger
         logMessage("AUCTION", auction->id, auction->requestStr);
+    logMessageToAnalytics("AUCTION", auction->id, auction->requestStr);
 
     const BidRequest & request = *auction->request;
     int numFields = 0;
@@ -2304,14 +2393,6 @@ onNewAuction(std::shared_ptr<Auction> auction)
     if (request.userIds.exchangeId) ++numFields;
     if (request.userIds.providerId) ++numFields;
 
-    if (numFields > 1) {
-        logMessageNoTimestamp("BEHAVIOUR",
-                              ML::format("%.2f", request.timestamp),
-                              request.exchange,
-                              reduceUrl(request.url),
-                              request.userIds.exchangeId,
-                              request.userIds.providerId);
-    }
     auto info = preprocessAuction(auction);
 
     if (info) {
@@ -2389,6 +2470,7 @@ doConfig(const std::string & agent,
     RouterProfiler profiler(dutyCycleCurrent.nsConfig);
     //const string fName = "Router::doConfig:";
     logMessage("CONFIG", agent, boost::trim_copy(config->toJson().toString()));
+    logMessageToAnalytics("CONFIG", agent, boost::trim_copy(config->toJson().toString()));
 
     // TODO: no need for this...
     auto newConfig = std::make_shared<AgentConfig>(*config);
@@ -2411,7 +2493,7 @@ doConfig(const std::string & agent,
 
     configure(agent, *newConfig);
     info.configured = true;
-    bidder->sendMessage(agent, "GOTCONFIG");
+    bidder->sendMessage(config, agent, "GOTCONFIG");
 
     info.filterIndex = filters.addConfig(agent, info);
 
@@ -2534,13 +2616,14 @@ sendPings()
          it != end;  ++it) {
         const string & agent = it->first;
         AgentInfo & info = it->second;
+        const auto& agentConfig = info.config;
 
         // 1.  Send out new pings
         Date now = Date::now();
         if (info.sendPing(0, now))
-            bidder->sendPingMessage(agent, 0);
+            bidder->sendPingMessage(agentConfig, agent, 0);
         if (info.sendPing(1, now))
-            bidder->sendPingMessage(agent, 1);
+            bidder->sendPingMessage(agentConfig, agent, 1);
 
         // 2.  Look at the trend
         //double mean, max;
@@ -2647,7 +2730,7 @@ submitToPostAuctionService(std::shared_ptr<Auction> auction,
                         + "-" + bid.agent;
     banker->detachBid(bid.account, auctionKey);
 
-    if (postAuctionEndpoint.isConnected()) {
+    if (connectPostAuctionLoop) {
         SubmittedAuctionEvent event;
         event.auctionId = auction->id;
         event.adSpotId = adSpotId;
@@ -2658,8 +2741,7 @@ submitToPostAuctionService(std::shared_ptr<Auction> auction,
         event.bidRequestStrFormat = auction->requestStrFormat ;
         event.bidResponse = bid;
 
-        Message<SubmittedAuctionEvent> message(std::move(event));
-        postAuctionEndpoint.sendMessage("AUCTION", message.toString());
+        postAuctionEndpoint.sendAuction(event);
     }
 
     if (auction.unique()) {
@@ -2764,14 +2846,16 @@ Router::
 getProviderIndicators()
     const
 {
-    bool connectedToPal = postAuctionEndpoint.isConnected();
+    bool connectedToPal = !connectPostAuctionLoop || postAuctionEndpoint.isConnected();
+    bool bankerOk = banker->getProviderIndicators().status;
 
     MonitorIndicator ind;
 
     ind.serviceName = serviceName();
-    ind.status = connectedToPal;
+    ind.status = connectedToPal && bankerOk;
     ind.message = string()
-        + "Connection to PAL: " + (connectedToPal ? "OK" : "ERROR");
+        + "Connection to PAL: " + (connectedToPal ? "OK" : "ERROR") + ", "
+        + "Banker: " + (bankerOk ? "OK": "ERROR");
 
     return ind;
 }

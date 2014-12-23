@@ -136,7 +136,11 @@ std::shared_ptr<ConnectionHandler>
 HttpNamedEndpoint::
 makeNewHandler()
 {
-    return std::make_shared<RestConnectionHandler>(this);
+    auto res = std::make_shared<RestConnectionHandler>(this);
+
+    // Allow it to get a shared pointer to itself
+    res->sharedThis = res;
+    return res;
 }
 
 
@@ -146,7 +150,7 @@ makeNewHandler()
 
 HttpNamedEndpoint::RestConnectionHandler::
 RestConnectionHandler(HttpNamedEndpoint * endpoint)
-    : endpoint(endpoint)
+    : endpoint(endpoint), isZombie(false)
 {
 }
 
@@ -155,8 +159,13 @@ HttpNamedEndpoint::RestConnectionHandler::
 handleHttpPayload(const HttpHeader & header,
                   const std::string & payload)
 {
+    // We don't lock here, since sending the response will take the lock,
+    // and whatever called us must know it's a valid connection
+
     try {
-        endpoint->onRequest(this, header, payload);
+        auto th = sharedThis.lock();
+        ExcAssert(th);
+        endpoint->onRequest(th, header, payload);
     }
     catch(const std::exception& ex) {
         Json::Value response;
@@ -179,10 +188,24 @@ handleHttpPayload(const HttpHeader & header,
 
 void
 HttpNamedEndpoint::RestConnectionHandler::
+handleDisconnect()
+{
+    std::unique_lock<std::mutex> guard(mutex);
+    //cerr << "*** Got handle disconnect for rest connection handler" << endl;
+    isZombie = true;
+    HttpConnectionHandler::handleDisconnect();
+}
+
+void
+HttpNamedEndpoint::RestConnectionHandler::
 sendErrorResponse(int code, const std::string & error)
 {
+    if (isZombie)
+        return;
+
     Json::Value val;
     val["error"] = error;
+
     sendErrorResponse(code, val);
 }
 
@@ -190,8 +213,14 @@ void
 HttpNamedEndpoint::RestConnectionHandler::
 sendErrorResponse(int code, const Json::Value & error)
 {
+    if (isZombie)
+        return;
+
     std::string encodedError = error.toString();
 
+    std::unique_lock<std::mutex> guard(mutex);
+    if (isZombie)
+        return;
     putResponseOnWire(HttpResponse(code, "application/json",
                                    encodedError, endpoint->extraHeaders),
                       nullptr, NEXT_CLOSE);
@@ -217,17 +246,65 @@ sendResponse(int code,
              const std::string & contentType,
              RestParams headers)
 {
+    // Recycle back to a new handler once done so that the next connection can be
+    // handled.
     auto onSendFinished = [=] {
         this->transport().associateWhenHandlerFinished
-        (std::make_shared<RestConnectionHandler>(endpoint),
-         "sendResponse");
+        (endpoint->makeNewHandler(), "sendResponse");
     };
     
     for (auto & h: endpoint->extraHeaders)
         headers.push_back(h);
 
+    std::unique_lock<std::mutex> guard(mutex);
+    if (isZombie)
+        return;
     putResponseOnWire(HttpResponse(code, contentType, body, headers),
                       onSendFinished);
+}
+
+void
+HttpNamedEndpoint::RestConnectionHandler::
+sendResponseHeader(int code,
+                   const std::string & contentType,
+                   RestParams headers)
+{
+    auto onSendFinished = [=] {
+        // Do nothing once we've finished sending the response, so that
+        // the connection isn't closed
+    };
+    
+    for (auto & h: endpoint->extraHeaders)
+        headers.push_back(h);
+
+    std::unique_lock<std::mutex> guard(mutex);
+    if (isZombie)
+        return;
+    putResponseOnWire(HttpResponse(code, contentType, headers),
+                      onSendFinished);
+}
+
+void
+HttpNamedEndpoint::RestConnectionHandler::
+sendHttpChunk(const std::string & chunk,
+              NextAction next,
+              OnWriteFinished onWriteFinished)
+{
+    std::unique_lock<std::mutex> guard(mutex);
+    if (isZombie)
+        return;
+    HttpConnectionHandler::sendHttpChunk(chunk, next, onWriteFinished);
+}
+
+
+void
+HttpNamedEndpoint::RestConnectionHandler::
+sendHttpPayload(const std::string & str)
+{
+    std::unique_lock<std::mutex> guard(mutex);
+    if (isZombie)
+        return;
+    send(str);
 }
 
 

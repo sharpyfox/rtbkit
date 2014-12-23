@@ -312,6 +312,7 @@ extern const Command HMSET;
 extern const Command WATCH;
 extern const Command MULTI;
 extern const Command EXEC;
+extern const Command EXISTS;
 extern const Command HSET;
 extern const Command HINCRBY;
 extern const Command KEYS;                           
@@ -323,9 +324,12 @@ extern const Command EXPIRE;
 extern const Command RANDOMKEY;
 extern const Command DEL;
 extern const Command SADD;
+extern const Command SMOVE;
 extern const Command SMEMBERS;
+extern const Command SISMEMBER;
 extern const Command TTL;
-
+extern const Command AUTH;
+extern const Command SELECT;
 
 /*****************************************************************************/
 /* ADDRESS                                                                   */
@@ -374,6 +378,8 @@ struct AsyncConnection {
         the connection works.
     */
     void test();
+    void auth(std::string password);
+    void select(int database);
 
     void close();
 

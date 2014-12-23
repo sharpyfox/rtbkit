@@ -12,7 +12,6 @@
 #include <boost/lexical_cast.hpp>
 
 #include "rtbkit/common/testing/exchange_source.h"
-#include "rtbkit/plugins/bid_request/openrtb_bid_request.h"
 #include "rtbkit/plugins/exchange/bidswitch_exchange_connector.h"
 #include "rtbkit/plugins/exchange/http_auction_handler.h"
 #include "rtbkit/core/router/router.h"
@@ -107,7 +106,10 @@ BOOST_AUTO_TEST_CASE( test_bidswitch )
               + std::to_string(c.format.width)
               + "&height="
               + std::to_string(c.format.height)
-              + "&price=${AUCTION_PRICE}\"/>";
+              + "&price=${AUCTION_PRICE}"
+              + "&account=%{response.account}"
+              + "&brtimestamp=%{bidrequest.timestamp}"
+              + "&brid=%{bidrequest.id}\"/>";
         c.providerConfig["bidswitch"]["adid"] = c.name;
     }
 
@@ -159,9 +161,16 @@ BOOST_AUTO_TEST_CASE( test_bidswitch )
 
     // and send it
     source.write(httpRequest);
-    std::cerr << source.read() << std::endl;
+    std::string resp = source.read();
+    
+    std::cerr << resp << std::endl;
 
     BOOST_CHECK_EQUAL(agent.numBidRequests, 1);
+
+    // Validate bidrequest.id was re-written
+    BOOST_CHECK_EQUAL(resp.find("%{bidrequest.id}"), std::string::npos);
+    BOOST_CHECK_EQUAL(resp.find("%{bidrequest.timestamp}"), std::string::npos);
+    BOOST_CHECK_EQUAL(resp.find("%{response.account}"), std::string::npos);
 
     proxies->events->dump(std::cerr);
 

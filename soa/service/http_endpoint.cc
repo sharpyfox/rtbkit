@@ -305,7 +305,7 @@ sendHttpChunk(const std::string & chunk,
               OnWriteFinished onWriteFinished)
 {
     // Add the chunk header
-    string fullChunk = ML::format("%zx\r\n%s", chunk.length(), chunk.c_str());
+    string fullChunk = ML::format("%zx\r\n%s\r\n", chunk.length(), chunk.c_str());
     send(fullChunk, next, onWriteFinished);
 }
 
@@ -363,10 +363,13 @@ putResponseOnWire(HttpResponse response,
         responseStr.append(response.contentType);
         responseStr.append("\r\n");
     }
-    responseStr.append("Content-Length: ");
-    responseStr.append(to_string(response.body.length()));
-    responseStr.append("\r\n");
-    responseStr.append("Connection: Keep-Alive\r\n");
+
+    if (response.sendBody) {
+        responseStr.append("Content-Length: ");
+        responseStr.append(to_string(response.body.length()));
+        responseStr.append("\r\n");
+        responseStr.append("Connection: Keep-Alive\r\n");
+    }
 
     for (auto & h: response.extraHeaders) {
         responseStr.append(h.first);

@@ -13,28 +13,59 @@
 #include <unordered_map>
 #include <vector>
 
-using namespace Datacratic;
+namespace Datacratic {
 
 void Logging::ConsoleWriter::head(char const * timestamp,
                                   char const * name,
                                   char const * function,
                                   char const * file,
                                   int line) {
-    stream << timestamp << " " << name << " " << file << ":" << line << " - " << function;
+    if(color) {
+        stream << timestamp << " " << "\033[1;32m" << name << " ";
+    }
+    else {
+        stream << timestamp << " " << name << " ";
+    }
 }
 
 void Logging::ConsoleWriter::body(std::string const & content) {
     if(color) {
-        stream << " \033[1;31m";
+        stream << "\033[1;34m";
         stream.write(content.c_str(), content.size() - 1);
         stream << "\033[0m\n";
     }
     else {
-        stream << " " << content;
+        stream << content;
     }
 
     std::cerr << stream.str();
     stream.str("");
+}
+
+void Logging::FileWriter::head(char const * timestamp,
+                               char const * name,
+                               char const * function,
+                               char const * file,
+                               int line) {
+    stream << timestamp << " " << name << " ";
+}
+
+void Logging::FileWriter::body(std::string const & content) {
+    file << stream.str() << content;
+    stream.str("");
+}
+
+void Logging::FileWriter::open(char const * filename, char const mode) {
+    if(mode == 'a')
+        file.open(filename, std::ofstream::app);
+    else if (mode == 'w')
+        file.open(filename);
+    else
+        throw ML::Exception("File mode not recognized");
+
+    if(!file) {
+        std::cerr << "unable to open log file '" << filename << "'" << std::endl;
+    }
 }
 
 void Logging::JsonWriter::head(char const * timestamp,
@@ -53,7 +84,13 @@ void Logging::JsonWriter::head(char const * timestamp,
 void Logging::JsonWriter::body(std::string const & content) {
     stream.write(content.c_str(), content.size() - 1);
     stream << "\"}\n";
-    std::cerr << stream.str();
+    if(!writer) {
+        std::cerr << stream.str();
+    }
+    else {
+        writer->body(stream.str());
+    }
+
     stream.str("");
 }
 
@@ -86,7 +123,7 @@ struct Logging::CategoryData {
     static CategoryData * getRoot();
     static CategoryData * get(char const * name);
 
-    static CategoryData * create(char const * name, char const * super);
+    static CategoryData * create(char const * name, char const * super, bool enabled);
     static void destroy(CategoryData * name);
 
     void activate(bool recurse = true);
@@ -95,9 +132,9 @@ struct Logging::CategoryData {
 
 private:
 
-    CategoryData(char const * name) :
+    CategoryData(char const * name, bool enabled) :
         initialized(false),
-        enabled(true),
+        enabled(enabled),
         name(name),
         parent(nullptr) {
     }
@@ -115,14 +152,14 @@ Logging::CategoryData * Logging::CategoryData::getRoot() {
     CategoryData * root = get("*");
     if (root) return root;
 
-    getRegistry().categories["*"].reset(root = new CategoryData("*"));
+    getRegistry().categories["*"].reset(root = new CategoryData("*", true /* enabled */));
     root->parent = root;
     root->writer = std::make_shared<ConsoleWriter>();
 
     return root;
 }
 
-Logging::CategoryData * Logging::CategoryData::create(char const * name, char const * super) {
+Logging::CategoryData * Logging::CategoryData::create(char const * name, char const * super, bool enabled) {
     Registry& registry = getRegistry();
     std::lock_guard<std::mutex> guard(registry.lock);
 
@@ -130,7 +167,7 @@ Logging::CategoryData * Logging::CategoryData::create(char const * name, char co
     CategoryData * data = get(name);
 
     if (!data) {
-        registry.categories[name].reset(data = new CategoryData(name));
+        registry.categories[name].reset(data = new CategoryData(name, enabled));
     }
     else {
         ExcCheck(!data->initialized,
@@ -141,18 +178,16 @@ Logging::CategoryData * Logging::CategoryData::create(char const * name, char co
 
     data->parent = get(super);
     if (!data->parent) {
-        registry.categories[super].reset(data->parent = new CategoryData(super));
+        registry.categories[super].reset(data->parent = new CategoryData(super, enabled));
     }
 
     data->parent->children.push_back(data);
 
     if (data->parent->initialized) {
         data->writer = data->parent->writer;
-        data->enabled = data->parent->enabled;
     }
     else {
         data->writer = root->writer;
-        data->enabled = root->enabled;
     }
 
     return data;
@@ -222,12 +257,16 @@ Logging::Category::Category(CategoryData * data) :
     data(data) {
 }
 
-Logging::Category::Category(char const * name, Category & super) :
-    data(CategoryData::create(name, super.name())) {
+Logging::Category::Category(char const * name, Category & super, bool enabled) :
+    data(CategoryData::create(name, super.name(), enabled)) {
 }
 
-Logging::Category::Category(char const * name, char const * super) :
-    data(CategoryData::create(name, super)) {
+Logging::Category::Category(char const * name, char const * super, bool enabled) :
+    data(CategoryData::create(name, super, enabled)) {
+}
+
+Logging::Category::Category(char const * name, bool enabled) :
+    data(CategoryData::create(name, "*", enabled)) {
 }
 
 Logging::Category::~Category()
@@ -288,3 +327,4 @@ void Logging::Thrower::operator&(std::ostream & stream) {
     throw ML::Exception(message);
 }
 
+} // namespace Datacratic
