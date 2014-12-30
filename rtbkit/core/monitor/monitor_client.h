@@ -9,7 +9,6 @@
 #include <vector>
 #include "soa/types/date.h"
 #include "soa/service/rest_proxy.h"
-#include "soa/service/logs.h"
 
 namespace RTBKIT {
     using namespace Datacratic;
@@ -49,13 +48,9 @@ struct MonitorClient : public RestProxy
     /** method invoked periodically to trigger a request to the Monitor */
     void checkStatus();
 
-    /** method invoked periodically to trigger a request to the Monitor */
-    void checkTimeout();
-
     /** method executed when we receive the response from the Monitor */
     void onResponseReceived(std::exception_ptr ext,
                             int responseCode, const std::string & body);
-    
     /** bound instance of onResponseReceived */
     RestProxy::OnDone onDone;
 
@@ -78,10 +73,6 @@ struct MonitorClient : public RestProxy
     /** helper members to make testing of dependent services easier */
     bool testMode;
     bool testResponse;
-
-    static Logging::Category print;
-    static Logging::Category error;
-    static Logging::Category trace;
 };
 
 } // RTB

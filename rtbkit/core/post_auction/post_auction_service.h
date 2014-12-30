@@ -52,8 +52,6 @@ struct PostAuctionService : public ServiceBase, public MonitorProvider
         loop.addSource(std::move(name), source, priority);
     }
 
-    /** Log a new auction that came in. */
-    virtual void logAuction(std::shared_ptr<SubmittedAuctionEvent> event);
 
     /************************************************************************/
     /* BANKER                                                               */
@@ -67,6 +65,7 @@ struct PostAuctionService : public ServiceBase, public MonitorProvider
     void setBanker(const std::shared_ptr<Banker> & newBanker)
     {
         matcher->setBanker(banker = newBanker);
+        monitorProviderClient.addProvider(banker.get());
     }
 
 

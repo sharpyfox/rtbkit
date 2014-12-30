@@ -65,7 +65,7 @@ struct AgentConfigurationService : public RestServiceEndpoint,
     }
 
     void unsafeDisableMonitor() {
-        monitorProviderClient.inhibit_ = true;
+        monitorProviderClient.disable();
     }
 
     /// Handler for POST /v1/agents/<name>/heartbeat
@@ -120,4 +120,3 @@ struct AgentConfigurationService : public RestServiceEndpoint,
 };
 
 } // namespace RTBKIT
-

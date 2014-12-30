@@ -37,7 +37,7 @@ PostAuctionService(
 
       loopMonitor(*this),
       configListener(getZmqContext()),
-      monitorProviderClient(getZmqContext(), *this),
+      monitorProviderClient(getZmqContext()),
 
       auctions(65536),
       events(65536),
@@ -46,7 +46,9 @@ PostAuctionService(
       endpoint(getZmqContext()),
       bridge(getZmqContext()),
       router(!!getZmqContext())
-{}
+{
+    monitorProviderClient.addProvider(this);
+}
 
 PostAuctionService::
 PostAuctionService(ServiceBase & parent, const std::string & serviceName)
@@ -57,7 +59,7 @@ PostAuctionService(ServiceBase & parent, const std::string & serviceName)
 
       loopMonitor(*this),
       configListener(getZmqContext()),
-      monitorProviderClient(getZmqContext(), *this),
+      monitorProviderClient(getZmqContext()),
 
       auctions(65536),
       events(65536),
@@ -66,7 +68,9 @@ PostAuctionService(ServiceBase & parent, const std::string & serviceName)
       endpoint(getZmqContext()),
       bridge(getZmqContext()),
       router(!!getZmqContext())
-{}
+{
+    monitorProviderClient.addProvider(this);
+}
 
 
 void
@@ -102,7 +106,7 @@ void
 PostAuctionService::
 initBidderInterface(Json::Value const & json)
 {
-    bidder = BidderInterface::create(serviceName() + ".bidder", getServices(), json);
+    bidder = BidderInterface::create("bidder", getServices(), json);
     bidder->init(&bridge);
 }
 
@@ -222,11 +226,7 @@ shutdown()
     monitorProviderClient.shutdown();
 }
 
-void
-PostAuctionService::
-logAuction(std::shared_ptr<SubmittedAuctionEvent> event) {
-    //dummy
-}
+
 
 void
 PostAuctionService::
@@ -400,7 +400,6 @@ PostAuctionService::
 doAuction(std::shared_ptr<SubmittedAuctionEvent> event)
 {
     stats.auctions++;
-    logAuction(event);
     matcher->doAuction(std::move(event));
 }
 

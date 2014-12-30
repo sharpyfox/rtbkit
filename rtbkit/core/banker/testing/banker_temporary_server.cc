@@ -78,7 +78,6 @@ start()
         // cerr << "initializing banker" << endl;
 
         banker->init(make_shared<RedisBankerPersistence>(redis));
-        banker->monitorProviderClient.inhibit_ = true;
 
         // cerr << "binding banker" << endl;
 
@@ -86,7 +85,6 @@ start()
 
         cerr << "MasterBanker: addrs = " << addr.first << "," << addr.second
              << endl;
-        bankerAddress = addr.second;
 
         // cerr << "running banker" << endl;
         banker->start();
@@ -162,7 +160,6 @@ shutdownWithSignal(int signum)
         throw ML::Exception(errno, "wait for banker shutdown");
 
     serverPid_ = -1;
-    bankerAddress = "";
 
     signal(SIGCHLD, oldHandler);
 }
@@ -182,4 +179,3 @@ exterminate()
 }
 
 } // namespace RTBKIT
-

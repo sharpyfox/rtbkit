@@ -18,6 +18,7 @@
 #include "soa/service/service_base.h"
 #include <future>
 #include "rtbkit/common/currency.h"
+#include "rtbkit/core/monitor/monitor_provider.h"
 #include "jml/arch/futex.h"
 #include "jml/arch/backtrace.h"
 #include "account.h"
@@ -248,7 +249,7 @@ struct Accountant {
 
 /** Abstract base class for a banker.  Defines the interface. */
 
-class Banker {
+class Banker : public MonitorProvider {
 public:
     Banker()
     {
@@ -356,6 +357,16 @@ public:
     {
     }
 
+    /*************************************************************************/
+    /* MONITOR PROVIDER                                                      */
+    /*************************************************************************/
+    virtual std::string getProviderClass() const
+    {
+        return "rtbBanker";
+    }
+
+    virtual MonitorIndicator getProviderIndicators() const = 0;
+
 protected:
     // For the supplied campaign make sure that the numbers match
     virtual void sanityCheck(const std::string &campaign) const
@@ -394,4 +405,3 @@ struct BankerException: public ML::Exception {
 } // namespace RTBKIT
 
 #endif /* __rtb_router__banker_h__ */
-
